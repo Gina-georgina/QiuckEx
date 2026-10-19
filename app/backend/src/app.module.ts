@@ -48,6 +48,7 @@ import { ContractsModule } from "./contracts/contracts.module";
 import { SorobanToolingModule } from "./soroban-tooling/soroban-tooling.module";
 import { OrganizationRoleGuard } from "./auth/guards/organization-role.guard";
 import { RateLimitConfigService } from "./config/rate-limit.config";
+import { RedisSlidingWindowRateLimitGuard } from "./config/redis-sliding-window-rate-limit.guard";
 import { EnvironmentParityModule } from "./environment-parity/environment-parity.module";
 import { IndexerLagModule } from "./indexer-lag";
 import { SupportBundleModule } from "./support-bundle/support-bundle.module";
