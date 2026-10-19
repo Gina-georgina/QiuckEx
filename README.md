@@ -254,5 +254,5 @@ Built with ❤️ by Pulsefy. Powered by Stellar. 🚀
 
 ## Handsoff notes
 
-<!-- handsoff-issue-395 -->
-- #395: design(frontend): Empty states and loading skeletons for all dashboard data sections
+<!-- handsoff-issue-371 -->
+- #371: feat(contract): Add contract upgrade safety gate with version registry
