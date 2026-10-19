@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { QRPreview } from "@/components/QRPreview";
+import { PaymentWizard } from "@/components/PaymentWizard/PaymentWizard";
 import { NetworkBadge } from "@/components/NetworkBadge";
 import { useApi } from "@/hooks/useApi";
 import { getQuickexApiBase } from "@/lib/api";
@@ -38,6 +39,7 @@ import {
   validateMemoInput,
 } from '@/lib/linkGenerator';
 import { notifyLinkCreated } from '@/lib/cacheInvalidation';
+import { MerchantPaymentPreferences } from '@/hooks/merchantPaymentPreferencesApi';
 
 type ValidationErrors = Partial<
   Record<"amount" | "asset" | "destination" | "memo", string>
@@ -78,6 +80,7 @@ type LinkMetadataSuccess = {
     amount: string;
     asset: string;
     destination?: string | null;
+    acceptedAssets?: string[] | null;
     memo: string | null;
     metadata?: Record<string, unknown>;
   };
@@ -138,6 +141,7 @@ export default function Generator() {
   });
 
   const [recipientAssetCode, setRecipientAssetCode] = useState("USDC");
+  const [merchantAcceptedAssets, setMerchantAcceptedAssets] = useState<string[] | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [sourceAssetCodes, setSourceAssetCodes] = useState<Set<string>>(
     () => new Set(["XLM", "USDC"]),
@@ -291,6 +295,29 @@ export default function Generator() {
       setRecipientAssetCode(assetOptions[0].code);
     }
   }, [assetOptions, recipientAssetCode]);
+
+  useEffect(() => {
+    setMerchantAcceptedAssets(null);
+    setRecipientAssetCode("USDC");
+    if (!/^G[A-Z2-7]{55}$/.test(form.destination)) return;
+    let active = true;
+    const url = new URL(`${apiBase}/merchant/payment-preferences`);
+    url.searchParams.set('publicKey', form.destination);
+    void fetch(url.toString(), { cache: 'no-store' })
+      .then(async (response) => response.ok ? response.json() : null)
+      .then((result: { preferences?: MerchantPaymentPreferences } | null) => {
+        const preferences = result?.preferences;
+        if (!active || !preferences || preferences.version < 1) return;
+        setMerchantAcceptedAssets(preferences.acceptedAssets);
+        setRecipientAssetCode(preferences.settlementAsset);
+      })
+      .catch(() => {
+        if (active) setMerchantAcceptedAssets(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [apiBase, form.destination]);
 
   const recipientRef = useMemo(() => {
     const a = verifiedAssets.find(
@@ -536,6 +563,7 @@ export default function Generator() {
           asset: recipientAssetCode,
           destination: form.destination,
           memo: form.memo || undefined,
+          acceptedAssets: merchantAcceptedAssets ?? undefined,
         }),
       });
       const json = await res.json();
@@ -1039,7 +1067,13 @@ export default function Generator() {
           </p>
         </header>
 
-        <div className="grid grid-cols-1 xl:grid-cols-[1.2fr_0.8fr] gap-12 xl:gap-20 max-w-7xl">
+        <PaymentWizard />
+
+        <details className="mt-10 max-w-7xl border-t border-border-strong pt-5">
+          <summary className="cursor-pointer text-sm font-semibold text-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300">
+            Open advanced payment builder
+          </summary>
+        <div className="mt-6 grid grid-cols-1 xl:grid-cols-[1.2fr_0.8fr] gap-12 xl:gap-20 max-w-7xl">
           <div className="space-y-12">
             <section className="space-y-6">
               <div>
@@ -1535,6 +1569,7 @@ export default function Generator() {
             </div>
           </div>
         </div>
+        </details>
 
         <section className="mt-20 max-w-7xl space-y-8">
           <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">

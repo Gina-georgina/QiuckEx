@@ -1,0 +1,46 @@
+{
+  "Landing": {
+    "title": "QuickEx",
+    "tagline": "Remesas globales, rápidas y sin fronteras",
+    "description": "Envía y recibe dinero a través de las fronteras con QuickEx. Rápido, seguro y construido sobre Stellar.",
+    "getStarted": "Comenzar",
+    "learnMore": "Más información",
+    "features": {
+      "title": "Por qué QuickEx",
+      "fast": {
+        "title": "Rápido",
+        "description": "Las transferencias se liquidan en segundos, no en días."
+      },
+      "secure": {
+        "title": "Seguro",
+        "description": "Tus fondos están protegidos por la red Stellar."
+      },
+      "global": {
+        "title": "Global",
+        "description": "Envía dinero a cualquier parte del mundo."
+      }
+    }
+  },
+  "Dashboard": {
+    "title": "Panel",
+    "welcome": "Bienvenido de nuevo",
+    "balance": "Saldo",
+    "send": "Enviar",
+    "receive": "Recibir",
+    "history": "Historial",
+    "settings": "Configuración",
+    "logout": "Cerrar sesión",
+    "claimUsername": "Reclamar nombre de usuario",
+    "usernameAvailable": "Nombre de usuario disponible",
+    "usernameTaken": "Nombre de usuario no disponible",
+    "checkingUsername": "Verificando disponibilidad..."
+  },
+  "Common": {
+    "loading": "Cargando...",
+    "error": "Algo salió mal",
+    "retry": "Reintentar",
+    "cancel": "Cancelar",
+    "confirm": "Confirmar",
+    "close": "Cerrar"
+  }
+}
