@@ -21,14 +21,32 @@ inputs:
     description: Optional per-PR namespace for preview deployments (e.g. pr-123)
     required: false
     default: ""
+  stellar_network:
+    description: Stellar network the deployment must target (staging/preview must be testnet)
+    required: false
+    default: "testnet"
 
 runs:
   using: composite
   steps:
+    - name: Enforce testnet-only for staging/preview
+      shell: bash
+      env:
+        ENVIRONMENT: ${{ inputs.environment }}
+        STELLAR_NETWORK: ${{ inputs.stellar_network }}
+      run: |
+        # Staging and preview deployments must never connect to mainnet.
+        if [ "${ENVIRONMENT}" != "production" ] && [ "${STELLAR_NETWORK}" != "testnet" ]; then
+          echo "::error::Refusing to deploy ${ENVIRONMENT} with STELLAR_NETWORK=${STELLAR_NETWORK} (must be testnet)"
+          exit 1
+        fi
+        echo "STELLAR_NETWORK=${STELLAR_NETWORK} (environment=${ENVIRONMENT})"
+
     - name: Trigger deployment
       shell: bash
       env:
         DEPLOY_TOKEN: ${{ inputs.deploy_token }}
+        STELLAR_NETWORK: ${{ inputs.stellar_network }}
       run: |
         # Replace this curl with your actual deploy platform call
         # (Render deploy hook, Railway redeploy, Fly.io deploy, etc.)
@@ -40,7 +58,11 @@ runs:
             "image": "${{ inputs.image_tag }}",
             "sha": "${{ inputs.git_sha }}",
             "environment": "${{ inputs.environment }}",
-            "preview_scope": "${{ inputs.preview_scope }}"
+            "preview_scope": "${{ inputs.preview_scope }}",
+            "env": {
+              "STELLAR_NETWORK": "'"${STELLAR_NETWORK}"'",
+              "ENABLE_MAINNET_FEATURES": "false"
+            }
           }' || true   # remove `|| true` once real endpoint is wired up
 
     - name: Wait for health check
@@ -69,4 +91,4 @@ runs:
     - name: Log release metadata
       shell: bash
       run: |
-        echo "::notice title=Release [${{ inputs.environment }}]::image=${{ inputs.image_tag }} | sha=${{ inputs.git_sha }} | env=${{ inputs.environment }} | preview_scope=${{ inputs.preview_scope }} | ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "::notice title=Release [${{ inputs.environment }}]::image=${{ inputs.image_tag }} | sha=${{ inputs.git_sha }} | env=${{ inputs.environment }} | preview_scope=${{ inputs.preview_scope }} | network=${{ inputs.stellar_network }} | ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
