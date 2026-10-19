@@ -26,6 +26,7 @@ import {
 } from "@/lib/activityFilters";
 import { PaymentHistoryFilters } from "@/components/PaymentHistoryFilters";
 import { cacheInvalidator } from "@/lib/cacheInvalidation";
+import { PaymentWizard } from "@/components/PaymentWizard/PaymentWizard";
 
 function toAnchorId(prefix: string, value: string) {
   return `${prefix}-${value.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
@@ -73,6 +74,7 @@ function DashboardContent() {
   const [listingsError, setListingsError] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [feedRetryCount, setFeedRetryCount] = useState(0);
+  const [wizardOpen, setWizardOpen] = useState(false);
 
   const refreshActivity = useCallback(async () => {
     setLoading(true);
@@ -363,6 +365,13 @@ function DashboardContent() {
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={() => setWizardOpen(true)}
+              className={`rounded-md bg-emerald-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-emerald-700 ${FOCUS_RING_CLASS}`}
+            >
+              Create payment link
+            </button>
             <Link
               href="/notifications"
               className={`rounded-xl border border-border-strong bg-surface px-4 py-3 text-sm font-semibold text-foreground transition hover:bg-surface-strong ${FOCUS_RING_CLASS}`}
@@ -391,6 +400,9 @@ function DashboardContent() {
             {statusMessage ??
               "Notifications can jump you directly into payments, active bids, and listing updates."}
           </p>
+          {wizardOpen ? (
+            <PaymentWizard onClose={() => setWizardOpen(false)} />
+          ) : null}
         </div>
 
         <section className="mb-10 grid grid-cols-1 gap-6 sm:grid-cols-2 md:mb-16 lg:grid-cols-3">
@@ -544,12 +556,13 @@ function DashboardContent() {
                 detected on the Stellar network. Create a payment link to get
                 started.
               </p>
-              <Link
-                href="/generator"
-                className={`mt-6 rounded-xl bg-indigo-500 px-5 py-2.5 text-sm font-semibold text-white shadow-lg transition hover:bg-indigo-400 ${FOCUS_RING_CLASS}`}
+              <button
+                type="button"
+                onClick={() => setWizardOpen(true)}
+                className={`mt-6 rounded-md bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-emerald-700 ${FOCUS_RING_CLASS}`}
               >
                 Create payment link
-              </Link>
+              </button>
             </div>
           ) : data.degraded && data.items.length === 0 ? (
             <div className="px-6 py-12 text-center sm:px-10">
