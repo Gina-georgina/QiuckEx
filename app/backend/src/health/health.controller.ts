@@ -27,7 +27,7 @@ export class HealthController {
     return res.status(200).json(result);
   }
 
-  @Get("ready")
+  @Get(["ready", "health/ready"])
   @ApiOperation({
     summary: "Readiness check",
     description:
