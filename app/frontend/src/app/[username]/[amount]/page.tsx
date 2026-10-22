@@ -1,12 +1,14 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { useParams } from 'next/navigation';
+import { useParams, useRouter } from 'next/navigation';
+import {
+  ScamBanner,
+  ScamInterstitial,
+  type ScamSignal,
+} from '@/components/scam/ScamWarning';
 
-interface ScamAlert {
-  isScam: boolean;
-  reason?: string;
-}
+type ScamAlert = ScamSignal;
 
 interface PaymentPageProps {
   scamAlert?: ScamAlert;
@@ -25,7 +27,13 @@ export default function PaymentPage({ scamAlert }: PaymentPageProps) {
   const amount = (params?.amount as string) ?? '';
 
   const [showExplainer, setShowExplainer] = useState(false);
+  const router = useRouter();
   const [alert, setAlert] = useState<ScamAlert | null>(scamAlert ?? null);
+  const [riskAccepted, setRiskAccepted] = useState(false);
+  const [bannerDismissed, setBannerDismissed] = useState(false);
+  // Treat alerts without an explicit confidence as high: fail safe.
+  const isHighConfidence = alert?.isScam === true && alert.confidence !== 'low';
+  const blocked = isHighConfidence && !riskAccepted;
 
   useEffect(() => {
     if (scamAlert) {
@@ -77,22 +85,16 @@ export default function PaymentPage({ scamAlert }: PaymentPageProps) {
 
   return (
     <main className="min-h-screen bg-white px-4 py-8 sm:px-6 sm:py-12">
-      <div className="mx-auto w-full max-w-md">
-        {alert?.isScam && (
-          <div
-            role="alert"
-            className="mb-6 rounded-lg border border-red-300 bg-red-50 p-4"
-          >
-            <p className="text-sm font-semibold text-red-800">
-              ⚠️ Warning: this payment request may be a scam
-            </p>
-            {alert.reason && (
-              <p className="mt-1 text-sm text-red-700">{alert.reason}</p>
-            )}
-            <p className="mt-2 text-sm text-red-700">
-              Do not send funds unless you trust the recipient.
-            </p>
-          </div>
+      {blocked && alert && (
+        <ScamInterstitial
+          alert={alert}
+          onProceed={() => setRiskAccepted(true)}
+          onCancel={() => router.push('/')}
+        />
+      )}
+      <div className="mx-auto w-full max-w-md" aria-hidden={blocked || undefined} inert={blocked || undefined}>
+        {alert?.isScam && !isHighConfidence && !bannerDismissed && (
+          <ScamBanner alert={alert} onDismiss={() => setBannerDismissed(true)} />
         )}
 
         <h1 className="text-2xl font-bold leading-tight text-gray-900 sm:text-3xl">
@@ -108,6 +110,7 @@ export default function PaymentPage({ scamAlert }: PaymentPageProps) {
           <button
             type="button"
             onClick={handleFreighter}
+            disabled={blocked}
             className="w-full rounded-lg bg-indigo-700 px-5 py-3.5 text-base font-semibold text-white shadow-sm transition-colors hover:bg-indigo-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2"
           >
             Pay with Freighter
@@ -116,6 +119,7 @@ export default function PaymentPage({ scamAlert }: PaymentPageProps) {
           <button
             type="button"
             onClick={handleLobstr}
+            disabled={blocked}
             className="w-full rounded-lg bg-indigo-700 px-5 py-3.5 text-base font-semibold text-white shadow-sm transition-colors hover:bg-indigo-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2"
           >
             Pay with Lobstr
