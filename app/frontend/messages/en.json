@@ -1,0 +1,49 @@
+{
+  "Metadata": {
+    "title": "QuickEx",
+    "description": "Global remittances powered by Stellar"
+  },
+  "Landing": {
+    "heroTitle": "Send money across borders, instantly",
+    "heroSubtitle": "QuickEx makes global remittances fast, cheap, and reliable using Stellar.",
+    "getStarted": "Get started",
+    "learnMore": "Learn more",
+    "featuresTitle": "Why QuickEx",
+    "featureFastTitle": "Fast settlements",
+    "featureFastDescription": "Transactions settle in seconds on the Stellar network.",
+    "featureLowCostTitle": "Low fees",
+    "featureLowCostDescription": "Send more with fees that stay out of the way.",
+    "featureSecureTitle": "Secure by design",
+    "featureSecureDescription": "Your funds are protected with battle-tested cryptography.",
+    "ctaTitle": "Ready to send your first payment?",
+    "ctaButton": "Create an account"
+  },
+  "Dashboard": {
+    "headerTitle": "Dashboard",
+    "headerSubtitle": "Overview of your account activity",
+    "welcome": "Welcome back",
+    "balance": "Balance",
+    "send": "Send",
+    "receive": "Receive",
+    "history": "Transaction history",
+    "settings": "Settings",
+    "logout": "Log out"
+  },
+  "Username": {
+    "label": "Username",
+    "placeholder": "Choose a username",
+    "checking": "Checking availability…",
+    "available": "Username is available",
+    "taken": "Username is already taken",
+    "invalid": "Username is invalid",
+    "claim": "Claim username"
+  },
+  "Common": {
+    "loading": "Loading…",
+    "error": "Something went wrong",
+    "retry": "Retry",
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "close": "Close"
+  }
+}

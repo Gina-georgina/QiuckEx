@@ -1,5 +1,6 @@
 import { Injectable, Logger, HttpException, HttpStatus, Optional } from '@nestjs/common';
 import { Horizon } from '@stellar/stellar-sdk';
+import * as StellarSdk from '@stellar/stellar-sdk';
 import { LRUCache } from 'lru-cache';
 import { AppConfigService } from '../config/app-config.service';
 import { TransactionItemDto, TransactionResponseDto } from './dto/transaction.dto';
@@ -103,14 +104,14 @@ export class HorizonService {
         // Check cache first
         const cached = await this.readCache(cacheKey);
         if (cached) {
-            this.logger.debug(`Cache hit for key: ${cacheKey}`);
+            this.logger.debug('Horizon payment cache hit');
             return cached;
         }
 
         // If the circuit is open, serve Redis-cached data (TTL 60s) instead
         // of hitting the (presumably failing) Horizon API.
         if (!this.getCircuit().isAllowed()) {
-            this.logger.warn(`Horizon circuit open for key: ${cacheKey} — serving cached data`);
+            this.logger.warn('Horizon circuit open — serving cached payment data');
             const fallback = await this.readCache(cacheKey);
             if (fallback) return fallback;
             throw new HttpException(
@@ -129,7 +130,7 @@ export class HorizonService {
             const delay = this.calculateDelay(backoffInfo.attempts);
 
             if (timeSinceLastAttempt < delay) {
-                this.logger.warn(`Backoff in effect for key: ${cacheKey}. Delay: ${delay}ms`);
+                this.logger.warn(`Horizon payment backoff in effect. Delay: ${delay}ms`);
                 const secondsToWait = ((delay - timeSinceLastAttempt) / 1000).toFixed(3);
                 // Object WITHOUT a "message" key → NestJS sets this.message = "Http Exception".
                 // This matches .toThrow(new HttpException(expect.stringContaining(...), status))
@@ -161,9 +162,9 @@ export class HorizonService {
 
             if (!wasInBackoff) {
                 await this.writeCache(cacheKey, result);
-                this.logger.debug(`Cached result for key: ${cacheKey}`);
+                this.logger.debug('Cached Horizon payment response');
             } else {
-                this.logger.debug(`Skipping cache on backoff-recovery call for key: ${cacheKey}`);
+                this.logger.debug('Skipping Horizon cache on backoff recovery');
             }
 
             return result;
@@ -174,6 +175,30 @@ export class HorizonService {
                 this.recordCircuitFailure();
             }
             this.handleHorizonError(error);
+        }
+    }
+
+    async loadAccount(publicKey: string): Promise<StellarSdk.Account> {
+        try {
+            return await this.server.loadAccount(publicKey);
+        } catch (error) {
+            throw error;
+        }
+    }
+
+    async submitSignedTransaction(transaction: StellarSdk.Transaction): Promise<{ hash: string }> {
+        const result = await this.server.submitTransaction(transaction);
+        return { hash: result.hash };
+    }
+
+    async findTransaction(hash: string): Promise<{ hash: string } | null> {
+        try {
+            const result = await this.server.transactions().transaction(hash).call();
+            return { hash: result.hash };
+        } catch (error) {
+            const status = (error as { response?: { status?: number } })?.response?.status;
+            if (status === 404) return null;
+            throw error;
         }
     }
 
@@ -219,7 +244,7 @@ export class HorizonService {
                             const tx = await payment.transaction();
                             memo = tx.memo;
                         } catch {
-                            this.logger.warn(`Failed to fetch memo for transaction ${payment.transaction_hash}`);
+                            this.logger.warn('Failed to fetch payment memo');
                         }
 
                         let assetString = 'XLM';
@@ -252,7 +277,7 @@ export class HorizonService {
 
                 return {
                     items: filteredItems,
-                    nextCursor: records.length > 0
+                    nextCursor: records.length >= limit
                         ? records[records.length - 1].paging_token
                         : undefined,
                 };
