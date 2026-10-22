@@ -132,3 +132,33 @@ jobs:
             /tmp/rc-*.log
           retention-days: 14
           if-no-files-found: ignore
+
+  load-test:
+    name: Payment-link load test (k6)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # RC validation only — never on pull requests. Fails the RC when the k6
+    # thresholds (p95 < 500 ms, error rate < 1%) are breached.
+    env:
+      BASE_URL: ${{ secrets.STAGING_API_URL }}
+      API_KEY: ${{ secrets.STAGING_API_KEY }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up k6
+        uses: grafana/setup-k6-action@v1
+
+      - name: Run payment-link creation load test
+        if: env.BASE_URL != ''
+        run: k6 run --summary-export=k6-summary.json app/backend/test/load/payment-link-creation.js
+
+      - name: Upload k6 summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-summary-${{ github.run_id }}
+          path: k6-summary.json
+          if-no-files-found: ignore

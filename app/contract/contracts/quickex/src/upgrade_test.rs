@@ -888,3 +888,41 @@ fn upgrade_safety_gate_non_admin_blocked() {
     let result = client.try_set_upgrade_window(&non_admin, &1u64, &0u64);
     assert!(result.is_err(), "set_upgrade_window by non-admin must fail");
 }
+
+// ============================================================================
+// Upgrade Regression Tests (CI gate) — Issue #475
+// ============================================================================
+//
+// Deploy the legacy base contract, swap in the current WASM, then drive the
+// upgrade safety gate with a compatible and an incompatible schema version.
+// Run in CI by the `upgrade-regression` job in `.github/workflows/contract.yml`.
+
+#[test]
+fn upgrade_regression_compatible_schema_version_passes_gate() {
+    let (env, gs) = build_golden_state();
+    let client = seed_admin_role(&env, &gs.contract_id, &gs.admin);
+    client.set_upgrade_window(&gs.admin, &1u64, &0u64);
+
+    client.start_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+    let version = client.complete_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+
+    assert_eq!(version, CURRENT_CONTRACT_VERSION);
+    assert_eq!(client.get_version(), CURRENT_CONTRACT_VERSION);
+}
+
+#[test]
+fn upgrade_regression_skipped_schema_version_fails_gate() {
+    let (env, gs) = build_golden_state();
+    let client = seed_admin_role(&env, &gs.contract_id, &gs.admin);
+    client.set_upgrade_window(&gs.admin, &1u64, &0u64);
+
+    let skipped_version = CURRENT_CONTRACT_VERSION + 2;
+    client.start_upgrade(&gs.admin, &skipped_version);
+    let result = client.try_complete_upgrade(&gs.admin, &skipped_version);
+
+    assert!(
+        result.is_err(),
+        "complete_upgrade must reject a schema version skip"
+    );
+    assert_eq!(client.get_version(), CURRENT_CONTRACT_VERSION);
+}
