@@ -77,6 +77,19 @@ function summarizeViolations(
   }));
 }
 
+function emitViolationAnnotation(violation: AxeViolationSummary): void {
+  const level = violation.impact === 'critical' || violation.impact === 'serious'
+    ? 'error'
+    : 'warning';
+  const details = `[${violation.impact ?? 'unknown'}] ${violation.help}. Elements: ${violation.targets.join(', ')}. Remediation: ${violation.helpUrl}`;
+  const escaped = details
+    .replace(/%/g, '%25')
+    .replace(/\r/g, '%0D')
+    .replace(/\n/g, '%0A');
+
+  console.log(`::${level} title=Axe ${violation.id}::${escaped}`);
+}
+
 /**
  * Run an axe accessibility scan against the current page.
  *
@@ -106,6 +119,10 @@ export async function runAxeScan(
   const results = await builder.analyze();
 
   const violations = summarizeViolations(results.violations);
+
+  for (const violation of violations) {
+    emitViolationAnnotation(violation);
+  }
 
   const critical = violations.filter((v) => v.impact === 'critical');
   const serious = violations.filter((v) => v.impact === 'serious');
@@ -163,6 +180,3 @@ export async function runAxeScan(
 }
 
 export default runAxeScan;
-</｜｜DSML｜｜ parameter>
-</｜｜DSML｜｜ invoke>
-</｜｜DSML｜｜ calls>
