@@ -177,6 +177,10 @@ Contributions are welcome and encouraged to help evolve QuickEx! To get started:
 
 All contributors must adhere to the [Code of Conduct](CODE_OF_CONDUCT.md) and sign off commits for DCO compliance. For more, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Security
+
+For information about reporting security vulnerabilities, please see our [Security Policy](SECURITY.md).
+
 ## License
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
