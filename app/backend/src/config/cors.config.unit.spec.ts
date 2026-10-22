@@ -1,4 +1,4 @@
-import { buildCorsOptions } from "./cors.config";
+import { buildCorsOptions, isCorsOriginAllowed } from "./cors.config";
 import { CorsOptions } from "@nestjs/common/interfaces/external/cors-options.interface";
 
 type OriginCallback = (err: Error | null, allow?: boolean) => void;
@@ -18,35 +18,38 @@ function resolveOrigin(
 
 describe("buildCorsOptions", () => {
   describe("non-production", () => {
-    it("returns origin: true in development", () => {
+    it("does not allow arbitrary origins in development", async () => {
       const opts = buildCorsOptions({ nodeEnv: "development", allowedOrigins: [] });
-      expect(opts.origin).toBe(true);
+      await expect(resolveOrigin(opts, "https://evil.com")).resolves.toBe(false);
     });
 
-    it("returns origin: true in test", () => {
+    it("does not allow arbitrary origins in test", async () => {
       const opts = buildCorsOptions({ nodeEnv: "test", allowedOrigins: [] });
-      expect(opts.origin).toBe(true);
+      await expect(resolveOrigin(opts, "https://evil.com")).resolves.toBe(false);
     });
   });
 
   describe("production — static origins", () => {
     const opts = buildCorsOptions({
       nodeEnv: "production",
-      allowedOrigins: ["https://quickex.to", "https://app.quickex.to"],
+      allowedOrigins: ["https://partner.quickex.to"],
     });
 
-    it("allows a listed origin", async () => {
+    it("allows the built-in production origin", async () => {
       await expect(resolveOrigin(opts, "https://quickex.to")).resolves.toBe(true);
     });
 
-    it("allows a second listed origin", async () => {
-      await expect(resolveOrigin(opts, "https://app.quickex.to")).resolves.toBe(true);
+    it("allows the built-in staging and local origins", async () => {
+      await expect(resolveOrigin(opts, "https://staging.quickex.to")).resolves.toBe(true);
+      await expect(resolveOrigin(opts, "http://localhost:3000")).resolves.toBe(true);
+    });
+
+    it("allows an origin added through configuration", async () => {
+      await expect(resolveOrigin(opts, "https://partner.quickex.to")).resolves.toBe(true);
     });
 
     it("blocks an unlisted origin", async () => {
-      await expect(resolveOrigin(opts, "https://evil.com")).rejects.toThrow(
-        "Origin not allowed",
-      );
+      await expect(resolveOrigin(opts, "https://evil.com")).resolves.toBe(false);
     });
 
     it("allows requests with no origin (server-to-server)", async () => {
@@ -70,13 +73,13 @@ describe("buildCorsOptions", () => {
     it("blocks a preview URL for a different project", async () => {
       await expect(
         resolveOrigin(opts, "https://other-project-abc123-team.vercel.app"),
-      ).rejects.toThrow("Origin not allowed");
+      ).resolves.toBe(false);
     });
 
     it("blocks a URL that tries to spoof the project name", async () => {
       await expect(
         resolveOrigin(opts, "https://evil-quickex-frontend-abc.vercel.app"),
-      ).rejects.toThrow("Origin not allowed");
+      ).resolves.toBe(false);
     });
 
     it("still allows the static production origin", async () => {
@@ -84,14 +87,16 @@ describe("buildCorsOptions", () => {
     });
   });
 
-  describe("production — no wildcard", () => {
-    it("does not set origin to true or '*' in production", () => {
-      const opts = buildCorsOptions({
-        nodeEnv: "production",
-        allowedOrigins: ["https://quickex.to"],
-      });
-      expect(opts.origin).not.toBe(true);
-      expect(opts.origin).not.toBe("*");
+  describe("preflight configuration", () => {
+    it("caches preflight responses for one day", () => {
+      const opts = buildCorsOptions({ nodeEnv: "production", allowedOrigins: [] });
+      expect(opts.maxAge).toBe(86400);
+    });
+
+    it("rejects disallowed preflight origins", () => {
+      expect(
+        isCorsOriginAllowed("https://evil.com", { allowedOrigins: [] }),
+      ).toBe(false);
     });
   });
 
