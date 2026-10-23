@@ -60,6 +60,8 @@ Notes on the layout:
 
 ## Setup Instructions
 
+> New contributor? Start with the [contributor onboarding guide](docs/CONTRIBUTOR-ONBOARDING.md) for a clean setup, local payment flow, tests, and troubleshooting.
+
 ### Prerequisites
 Before getting started, ensure you have the following installed:
 - Node.js 20+ ([nodejs.org](https://nodejs.org)). This matches the version used in CI (`.github/workflows/ci.yml`).
