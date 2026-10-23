@@ -37,6 +37,7 @@ export class CircuitBreaker {
   private consecutiveSuccesses = 0;
   private lastOpenedAt = 0;
   private lastProbeAt = 0;
+  private probeInFlight = false;
   private transitionCount = 0;
 
   constructor(options: CircuitBreakerOptions = {}) {
@@ -65,10 +66,13 @@ export class CircuitBreaker {
         ) {
           this.setState("half_open");
           this.lastProbeAt = now;
+          this.probeInFlight = true;
           return true;
         }
         return false;
       case "half_open":
+        if (this.probeInFlight) return false;
+        this.probeInFlight = true;
         return true;
       default:
         return true;
@@ -78,6 +82,7 @@ export class CircuitBreaker {
   onSuccess(): void {
     this.failures = [];
     if (this.state === "half_open") {
+      this.probeInFlight = false;
       this.consecutiveSuccesses += 1;
       if (this.consecutiveSuccesses >= this.successThreshold) {
         // Reset to closed after a successful probe.
@@ -93,6 +98,7 @@ export class CircuitBreaker {
     const now = this.now();
     if (this.state === "half_open") {
       // A failure during a probe re-opens the circuit.
+      this.probeInFlight = false;
       this.setState("open");
       this.lastOpenedAt = now;
       this.consecutiveSuccesses = 0;
@@ -133,6 +139,7 @@ export class CircuitBreaker {
     this.consecutiveSuccesses = 0;
     this.lastOpenedAt = 0;
     this.lastProbeAt = 0;
+    this.probeInFlight = false;
     this.setState("closed");
   }
 

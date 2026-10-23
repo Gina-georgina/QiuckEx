@@ -1,5 +1,5 @@
-# Upgrade Safety Gate & Post-Upgrade Invariants
-**Issue #432** | Wave 5 – Lifecycle Management
+# Upgrade Safety Gate, Version Guard & Post-Upgrade Invariants
+**Issue #432 & #450** | Wave 5 – Lifecycle Management
 
 > **Legacy procedure:** This document records the original single-admin upgrade gate. It applies only before `initialize_governance` is called. Production deployments with governance initialized must use the M-of-N proposal and timelock lifecycle in [GOVERNANCE_AND_COMPATIBILITY.md](./GOVERNANCE_AND_COMPATIBILITY.md); direct legacy admin operations and standalone migration then fail with `GovernanceRequired` (206).
 
@@ -26,6 +26,8 @@ New storage keys added to `DataKey` enum:
 | `UpgradeWindowStart`     | u64  | Ledger timestamp when upgrades become allowed |
 | `UpgradeWindowEnd`       | u64  | Ledger timestamp when upgrades become blocked (0 = unbounded) |
 | `UpgradeInProgress`      | bool | Flag: upgrade currently in-flight |
+| `SchemaVersion`          | u32  | Stored on-chain storage schema version (`SCHEMA_VERSION = 1`) |
+| `PendingUpgradeVersion`  | u32  | Target schema version recorded during `start_upgrade` |
 
 ---
 
