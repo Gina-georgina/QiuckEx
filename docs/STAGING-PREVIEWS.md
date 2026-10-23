@@ -6,6 +6,11 @@ This document describes the staging preview system: how previews are triggered, 
 
 Staging previews provide an ephemeral, fully isolated environment for every pull request. Each preview gets its own deterministic scope id, its own set of deployed resources, and its own runtime configuration. Previews are deployed to **testnet only** — production networks are never touched by the preview pipeline.
 
+Every pull request receives two preview deployments:
+
+- **Frontend** — a Vercel preview deployment with a unique URL per PR.
+- **Backend** — a separate staging service namespaced by the PR's scope id.
+
 ## Triggers
 
 A staging preview is created or updated when:
@@ -30,6 +35,7 @@ All preview jobs run inside the `preview` GitHub environment. This environment h
 | `PREVIEW_MIGRATE_TOKEN` | Secret | Token used to run migrations against the preview database. |
 | `PREVIEW_SMOKE_TOKEN` | Secret | Token used by the smoke-test suite. |
 | `PREVIEW_TEARDOWN_TOKEN` | Secret | Token used to destroy preview resources. |
+| `VERCEL_TOKEN` | Secret | Token used to create Vercel preview deployments. |
 | `PREVIEW_NETWORK` | Variable | Network the preview targets. Must be a testnet. |
 | `PREVIEW_BASE_DOMAIN` | Variable | Base domain under which preview URLs are published. |
 
@@ -49,7 +55,7 @@ The scope id is used to:
 - Key the preview's runtime configuration.
 - Tag the PR comment so it can be updated in place rather than duplicated.
 
-Because the scope id is a pure function of the pull request number, re-running the pipeline for the same PR always targets the same resources. This makes previews idempotent: a re-run updates the existing preview rather than creating a second one.
+Because the scope id is a pure function of the pull request number, re-running the pipeline for the same PR always targets the same resources. This makes previews idempotent: a re-run updates the existing preview rather than creating a second one. The scope id also guarantees the preview URL is unique per PR.
 
 ## Lifecycle
 
@@ -61,8 +67,8 @@ The deploy phase provisions the preview's infrastructure and application:
 
 - Resolves the scope id from the pull request number.
 - Applies the preview runtime configuration (see [RUNTIME-CONFIG-MATRIX.md](./RUNTIME-CONFIG-MATRIX.md) for the full env var list).
-- Deploys the application and its dependencies into the scope.
-- Publishes the preview URL under `PREVIEW_BASE_DOMAIN`.
+- Deploys the frontend as a Vercel preview deployment and the backend as a separate staging service into the scope.
+- Publishes the preview URLs under `PREVIEW_BASE_DOMAIN`.
 
 ### 2. Migrate
 
@@ -98,8 +104,8 @@ The pipeline maintains a single comment on the pull request, identified by a hid
 The comment reports:
 
 - The current lifecycle phase and its status (pending, running, succeeded, failed).
-- The preview URL once the deploy phase completes.
-- The result of the migrate and smoke-test phases.
+- The frontend and backend preview URLs once the deploy phase completes.
+- The result of the basic health check, migrate, and smoke-test phases.
 - A teardown notice when the preview is destroyed.
 
 If a phase fails, the comment surfaces the failure and links to the failing job's logs.
@@ -110,6 +116,8 @@ Previews are restricted to testnets. The pipeline enforces this in two places:
 
 1. **Configuration validation** — `PREVIEW_NETWORK` is validated against an allowlist of testnet identifiers. A non-testnet value fails the pipeline before any resources are provisioned.
 2. **Runtime guard** — the deploy and migrate phases assert the resolved network is a testnet before performing any mutating operation.
+
+In addition, the workflow sets `STELLAR_NETWORK=testnet` for every preview job and fails fast if the value is anything else. Mainnet feature flags are blocked: the workflow rejects any `*_MAINNET*` feature flag being enabled in the preview configuration.
 
 This ensures a misconfigured preview can never deploy to, migrate, or smoke-test against a production network.
 

@@ -1,11 +1,15 @@
 import type { Metadata } from "next";
+import { NextIntlClientProvider } from "next-intl";
+import { getLocale, getMessages } from "next-intl/server";
 import { Header } from "@/components/Header";
 import { StagingBanner } from "@/components/StagingBanner";
 import { EnvGuard } from "@/components/EnvGuard";
+import { OnboardingModal } from "@/components/onboarding/OnboardingModal";
 import { NotificationCenterProvider } from "@/components/NotificationCenterProvider";
 import { ErrorReportingShell } from "@/components/ErrorReportingShell";
 import { ThemeProvider, themeInitScript } from "@/components/ThemeProvider";
 import { BootstrapProvider } from "@/contexts/BootstrapContext";
+import { defaultLocale, getDirection, isLocale } from "@/i18n/config";
 import "./globals.css";
 
 const siteUrl =
@@ -50,53 +54,61 @@ export const metadata: Metadata = {
   },
 };
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
+  const requestedLocale = await getLocale();
+  const locale = isLocale(requestedLocale) ? requestedLocale : defaultLocale;
+  const messages = await getMessages();
+  const dir = getDirection(locale);
+
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang={locale} dir={dir} suppressHydrationWarning>
       <head>
         <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
       </head>
       <body className="bg-background text-foreground antialiased">
-        <StagingBanner />
-        <ThemeProvider>
-          <BootstrapProvider>
-            <NotificationCenterProvider>
-              <EnvGuard>
-                <Header />
-                <ErrorReportingShell>
-                  <main
-                    id="main-content"
-                    tabIndex={-1}
-                    className="min-h-screen container mx-auto px-6 py-10 focus:outline-none"
-                  >
-                    {children}
-                  </main>
-                </ErrorReportingShell>
+        <NextIntlClientProvider locale={locale} messages={messages}>
+          <StagingBanner />
+          <ThemeProvider>
+            <BootstrapProvider>
+              <NotificationCenterProvider>
+                <EnvGuard>
+                  <Header />
+                  <ErrorReportingShell>
+                    <main
+                      id="main-content"
+                      tabIndex={-1}
+                      className="min-h-screen container mx-auto px-6 py-10 focus:outline-none"
+                    >
+                      {children}
+                    </main>
+                  </ErrorReportingShell>
+                  <OnboardingModal />
 
-                <footer className="container mx-auto border-t border-border px-6 py-12 text-sm text-subtle">
-                  <div className="flex flex-col items-center justify-between gap-6 md:flex-row">
-                    <p>Copyright 2026 QuickEx Platform. Built by Pulsefy.</p>
-                    <div className="flex gap-8 underline decoration-border underline-offset-4 hover:decoration-border-strong">
-                      <a
-                        href="https://github.com/pulsefy/QuickEx"
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        GitHub
-                      </a>
-                      <a href="#">Terms</a>
-                      <a href="#">Privacy</a>
+                  <footer className="container mx-auto border-t border-border px-6 py-12 text-sm text-subtle">
+                    <div className="flex flex-col items-center justify-between gap-6 md:flex-row">
+                      <p>Copyright 2026 QuickEx Platform. Built by Pulsefy.</p>
+                      <div className="flex gap-8 underline decoration-border underline-offset-4 hover:decoration-border-strong">
+                        <a
+                          href="https://github.com/pulsefy/QuickEx"
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          GitHub
+                        </a>
+                        <a href="#">Terms</a>
+                        <a href="#">Privacy</a>
+                      </div>
                     </div>
-                  </div>
-                </footer>
-              </EnvGuard>
-            </NotificationCenterProvider>
-          </BootstrapProvider>
-        </ThemeProvider>
+                  </footer>
+                </EnvGuard>
+              </NotificationCenterProvider>
+            </BootstrapProvider>
+          </ThemeProvider>
+        </NextIntlClientProvider>
       </body>
     </html>
   );

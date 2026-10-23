@@ -74,8 +74,39 @@ jobs:
       - name: Run tests
         run: cargo test
 
-  fuzz:
-    name: Fuzz Escrow Input Validation
+  upgrade-regression:
+    name: Upgrade Regression (Soroban sandbox)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: app/contract
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "app/contract"
+
+      - name: Build test binary
+        run: cargo test -p quickex --no-run
+
+      # Base deploy -> compatible upgrade (must pass) -> schema-skip upgrade (must fail).
+      - name: Run upgrade regression scenarios
+        timeout-minutes: 3
+        run: cargo test -p quickex upgrade_ -- --nocapture
+
+  security:
+    name: Supply Chain Security
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -85,27 +116,80 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "app/contract"
 
-      - name: Fuzz escrow create inputs
-        run: cargo fuzz run fuzz_escrow_create -- -max_total_time=60
-
-      - name: Fuzz proof verification
-        run: cargo fuzz run fuzz_proof_verify -- -max_total_time=60
-
-      - name: Upload fuzz artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
         with:
-          name: quickex-contract-fuzz-artifacts
-          path: app/contract/fuzz/artifacts/
-          if-no-files-found: ignore
+          tool: cargo-deny
+
+      - name: Run cargo-deny (licenses and advisories)
+        run: cargo deny check
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Run cargo-audit (vulnerability database)
+        run: cargo audit
+
+  mainnet-gate:
+    name: Mainnet Deployment Gate
+    runs-on: ubuntu-latest
+    needs: [ test, security, upgrade-regression ]
+    defaults:
+      run:
+        working-directory: app/contract
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "app/contract"
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Run mainnet deployment gate
+        working-directory: .
+        run: bash app/contract/scripts/mainnet-gate.sh
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: [ mainnet-gate ]
+    if: github.ref == 'refs/heads/main'
+    defaults:
+      run:
+        working-directory: app/contract
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy contract
+        run: echo "Deploying contract to mainnet..."

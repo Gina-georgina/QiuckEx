@@ -51,6 +51,9 @@ If you prefer to set up the environment manually on your host machine:
    cargo build --target wasm32-unknown-unknown --release
    ```
 
+### 3. Mobile App
+See the [Mobile App Contributor Guide](app/mobile/CONTRIBUTOR-GUIDE.md) for Expo CLI setup, Android/iOS emulator configuration, running on a physical device, and running Jest/Maestro tests.
+
 ## Branch Naming
 
 - Feature branches: `feat/<short-description>`

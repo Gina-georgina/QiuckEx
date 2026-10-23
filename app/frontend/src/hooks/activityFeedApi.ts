@@ -15,6 +15,8 @@ export interface ActivityFeedItem {
   source: string;
   destination: string;
   timestamp: string; // raw ISO for sorting
+  fee?: string | null;
+  ledger?: number | null;
 }
 
 interface BackendTransactionItem {
@@ -27,10 +29,13 @@ interface BackendTransactionItem {
   status: "Success" | "Pending";
   txHash: string;
   pagingToken: string;
+  fee?: string;
+  ledger?: number;
 }
 
 interface BackendResponse {
   items: BackendTransactionItem[];
+  nextCursor?: string;
 }
 
 function simplifyAsset(asset: string): string {
@@ -74,14 +79,30 @@ function mapToActivityItem(item: BackendTransactionItem): ActivityFeedItem {
     source: item.source,
     destination: item.destination,
     timestamp: item.timestamp,
+    fee: item.fee ?? null,
+    ledger: item.ledger ?? null,
   };
 }
 
 export interface ActivityFeedResponse {
   items: ActivityFeedItem[];
+  nextCursor?: string;
   /** True when the backend returned no data or the request failed gracefully */
   degraded: boolean;
   error?: string;
+}
+
+export function appendUniqueActivityItems(
+  existing: ActivityFeedItem[],
+  incoming: ActivityFeedItem[],
+): ActivityFeedItem[] {
+  const seen = new Set(existing.map((item) => item.id));
+  const uniqueIncoming = incoming.filter((item) => {
+    if (seen.has(item.id)) return false;
+    seen.add(item.id);
+    return true;
+  });
+  return [...existing, ...uniqueIncoming];
 }
 
 /**
@@ -90,28 +111,28 @@ export interface ActivityFeedResponse {
  */
 export async function fetchActivityFeed(
   limit = 20,
+  cursor?: string,
 ): Promise<ActivityFeedResponse> {
-  const publicKey = resolvePublicKey();
-  const url = new URL(`${getQuickexApiBase()}/payments/recent`);
-  url.searchParams.set("address", publicKey);
-  url.searchParams.set("limit", String(limit));
-
   try {
+    const publicKey = resolvePublicKey();
+    const url = new URL(`${getQuickexApiBase()}/payments/recent`);
+    url.searchParams.set("address", publicKey);
+    url.searchParams.set("limit", String(limit));
+    if (cursor) url.searchParams.set("cursor", cursor);
+
     const res = await fetch(url.toString(), { method: "GET" });
 
     if (!res.ok) {
-      throw new Error(
-        `Activity feed request failed with status ${res.status}`,
-      );
+      throw new Error("Recent payments are temporarily unavailable.");
     }
 
     const data = (await res.json()) as BackendResponse;
     return {
       items: (data.items ?? []).map(mapToActivityItem),
+      nextCursor: data.nextCursor,
       degraded: false,
     };
   } catch (error) {
-    console.warn("Activity feed: backend unavailable, returning empty list:", error);
     return {
       items: [],
       degraded: true,

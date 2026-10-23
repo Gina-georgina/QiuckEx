@@ -60,6 +60,7 @@ export interface UsernameRow {
 @Injectable()
 export class UsernamesService {
   private readonly logger = new Logger(UsernamesService.name);
+  private readonly logger = new Logger(UsernamesService.name);
 
   constructor(
     private readonly supabase: SupabaseService,
@@ -370,11 +371,9 @@ export class UsernamesService {
       ...extra,
     };
     if (outcome === "updated" || outcome === "noop") {
-      // eslint-disable-next-line no-console
-      console.log(JSON.stringify(payload));
+      this.logger.log(payload);
     } else {
-      // eslint-disable-next-line no-console
-      console.warn(JSON.stringify(payload));
+      this.logger.warn(payload);
     }
   }
 

@@ -9,6 +9,8 @@
     "type-check": "turbo run type-check",
     "test": "turbo run test",
     "test:mutation": "pnpm --filter @quickex/backend run test:mutation",
+    "db:migrate": "pnpm --filter @quickex/backend run db:migrate",
+    "db:rollback": "bash scripts/rollback-migration.sh",
     "db:verify-migrations": "pnpm --filter @quickex/backend run db:verify-migrations",
     "test:perf:horizon": "pnpm --filter @quickex/backend run test:perf:horizon",
     "check:generated-types": "node scripts/check-generated-types.js",

@@ -260,3 +260,32 @@ AsyncStorage.getItem('@selected_environment')
 | P1 | Move rate-limit testnet overrides to env vars | #7 |
 | P2 | Consolidate all URLs to `quickex.to` TLD | #8 |
 | P2 | Implement backend `GET /session/bootstrap` and `POST /feedback` | #14 |
+
+---
+
+## 8. Database Migration Configuration & Rollback Procedure
+
+Database migrations (`app/backend/supabase/migrations/`) are validated in CI via the `migration-smoke-test` job in `.github/workflows/ci.yml` and gate production deployments in `.github/workflows/cd.yml`.
+
+| Variable / Script | Purpose | Default / Behavior |
+|---|---|---|
+| `DATABASE_URL` / `SUPABASE_DB_URL` | PostgreSQL connection string used by `app/backend/run-migration-supabase.js` and `scripts/rollback-migration.sh` | Local default: `postgresql://postgres:postgres@127.0.0.1:54322/postgres` |
+| `MIGRATION_TEST_SCHEMA` | Target PostgreSQL schema for fresh-schema CI smoke tests | `public` (`migration_smoke_test` in CI smoke-test mode) |
+| `CONFIRM_ROLLBACK` | Required confirmation guard (`1`) when running `scripts/rollback-migration.sh` in production/mainnet without `--yes` | `0` (blocks unconfirmed production rollbacks) |
+| `node app/backend/run-migration-supabase.js --smoke-test` | Spins up a fresh test schema, applies all migrations in sequential order, and asserts the final schema state | Executed on PRs in `ci.yml` and before `release` in `cd.yml` |
+| `./scripts/rollback-migration.sh` | Reverts the most recent applied migration using `app/backend/supabase/migrations/rollback/` | Supports `--dry-run`, `--steps <n>`, `--target <version>`, `--yes` |
+
+### Quick Rollback Commands
+
+```bash
+# 1. Preview the most recent migration rollback without modifying the database
+./scripts/rollback-migration.sh --dry-run
+
+# 2. Revert the most recent migration (local / staging)
+./scripts/rollback-migration.sh
+
+# 3. Revert the most recent migration in production (requires explicit --yes or CONFIRM_ROLLBACK=1)
+ENVIRONMENT_NAME=production DATABASE_URL="$PRODUCTION_DATABASE_URL" ./scripts/rollback-migration.sh --yes
+```
+
+For full operational details, multi-step rollbacks, and post-rollback verification steps, see [MIGRATION-RUNBOOK.md](./MIGRATION-RUNBOOK.md).

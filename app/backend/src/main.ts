@@ -14,7 +14,7 @@ import { winstonConfig } from "./common/logging/winston.config";
 import { LoggingInterceptor } from "./common/interceptors/logging.interceptor";
 // ----------------------------------------
 
-import { buildCorsOptions } from "./config/cors.config";
+import { buildCorsOptions, isCorsOriginAllowed } from "./config/cors.config";
 import { AppConfigService } from "./config";
 import { AppModule } from "./app.module";
 import { resolveNetworkSnapshot } from "./config/network.config";
@@ -104,13 +104,22 @@ async function bootstrap() {
   // Use Helmet for security headers
   app.use(helmet());
 
-  app.enableCors(
-    buildCorsOptions({
-      nodeEnv: configService.nodeEnv,
-      allowedOrigins: configService.corsAllowedOrigins,
-      vercelProject: configService.corsVercelProject,
-    }),
-  );
+  const corsConfig = {
+    nodeEnv: configService.nodeEnv,
+    allowedOrigins: configService.corsAllowedOrigins,
+    vercelProject: configService.corsVercelProject,
+  };
+  app.use((request, response, next) => {
+    if (
+      request.method === "OPTIONS" &&
+      !isCorsOriginAllowed(request.headers.origin, corsConfig)
+    ) {
+      response.sendStatus(403);
+      return;
+    }
+    next();
+  });
+  app.enableCors(buildCorsOptions(corsConfig));
 
   // Global validation pipe
   app.useGlobalPipes(

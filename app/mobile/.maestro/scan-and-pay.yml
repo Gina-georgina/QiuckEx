@@ -1,0 +1,47 @@
+# Maestro E2E: QR scan -> payment confirmation -> success (Issue #470)
+#
+# QR injection: Maestro cannot feed frames to the camera, so the decoded QR
+# payload is injected as the app's deep link (the same URL a QuickEx QR
+# encodes). The app runs with EXPO_PUBLIC_USE_MOCK_API=true in CI, so no real
+# backend or wallet is contacted.
+appId: com.pulsefy.quickex
+env:
+  RECIPIENT: alice
+  AMOUNT: "50"
+  ASSET: USDC
+---
+- launchApp:
+    clearState: true
+    permissions:
+      camera: unset
+
+# 1. Open scanner and grant camera permission
+- tapOn: "Scan to Pay"
+- runFlow:
+    when:
+      visible: "Grant Permission"
+    commands:
+      - tapOn: "Grant Permission"
+- runFlow:
+    when:
+      visible: "(While using the app|Allow|Only this time)"
+    commands:
+      - tapOn: "(While using the app|Allow|Only this time)"
+
+# 2. Inject mock QR payload
+- openLink: "quickex://payment-confirmation?username=${RECIPIENT}&amount=${AMOUNT}&asset=${ASSET}&privacy=false"
+
+# 3. Confirmation screen shows correct amount and recipient
+- extendedWaitUntil:
+    visible: "Confirm Payment"
+    timeout: 10000
+- assertVisible: ".*${RECIPIENT}.*"
+- assertVisible: ".*${AMOUNT}.*"
+- assertVisible: ".*${ASSET}.*"
+
+# 4. Confirm -> success state
+- tapOn:
+    id: "pay-with-wallet-button"
+- extendedWaitUntil:
+    visible: ".*(Payment (Sent|Successful|Submitted)|Success).*"
+    timeout: 15000
