@@ -26,7 +26,7 @@ if [[ "$RUN_LOCAL_TESTS" == "1" ]]; then need cargo; fi
 if [[ -n "$CONTRACT_ID" || -n "$SOURCE" ]]; then need "$STELLAR_BIN"; fi
 
 if [[ "$RUN_LOCAL_TESTS" == "1" ]]; then
-  echo "==> Running local upgrade invariant tests"
+  echo "==> Running local upgrade invariant and schema version guard pre-flight tests"
   cargo test -p quickex upgrade_harness_ -- --nocapture
   cargo test -p quickex upgrade_safety_gate_ -- --nocapture
 fi
@@ -47,12 +47,19 @@ if [[ -n "$CONTRACT_ID" && -n "$SOURCE" ]]; then
   BEFORE_METADATA="$($STELLAR_BIN contract invoke --id "$CONTRACT_ID" --source "$SOURCE" --network "$NETWORK" -- get_deployment_metadata 2>/dev/null || echo '{}')"
 
   if [[ -n "$NEW_VERSION" ]]; then
-    echo "==> Running testnet upgrade rehearsal against $CONTRACT_ID"
+    echo "==> Validating pre-flight schema version guard against $CONTRACT_ID"
+    OLD_SCHEMA_VERSION="$($STELLAR_BIN contract invoke --id "$CONTRACT_ID" --source "$SOURCE" --network "$NETWORK" -- get_schema_version 2>/dev/null || echo '0')"
+    EXPECTED_VERSION=$((OLD_SCHEMA_VERSION + 1))
+    if [[ "$NEW_VERSION" != "$EXPECTED_VERSION" ]]; then
+      echo "error: schema version guard failed: new_version ($NEW_VERSION) != old_version ($OLD_SCHEMA_VERSION) + 1" >&2
+      exit 1
+    fi
+    echo "==> Running testnet upgrade rehearsal against $CONTRACT_ID (schema $OLD_SCHEMA_VERSION -> $NEW_VERSION)"
     $STELLAR_BIN contract invoke --id "$CONTRACT_ID" --source "$SOURCE" --network "$NETWORK" -- set_upgrade_window --caller "$SOURCE" --start "$START_TS" --end "$END_TS"
     $STELLAR_BIN contract invoke --id "$CONTRACT_ID" --source "$SOURCE" --network "$NETWORK" -- start_upgrade --caller "$SOURCE" --new_version "$NEW_VERSION"
-    $STELLAR_BIN contract invoke --id "$CONTRACT_ID" --source "$SOURCE" --network "$NETWORK" -- upgrade --new_wasm_hash "$WASM_SHA" || true
+    $STELLAR_BIN contract invoke --id "$CONTRACT_ID" --source "$SOURCE" --network "$NETWORK" -- upgrade --caller "$SOURCE" --new_wasm_hash "$WASM_SHA" || true
     $STELLAR_BIN contract invoke --id "$CONTRACT_ID" --source "$SOURCE" --network "$NETWORK" -- complete_upgrade --caller "$SOURCE" --new_version "$NEW_VERSION"
-    $STELLAR_BIN contract invoke --id "$CONTRACT_ID" --source "$SOURCE" --network "$NETWORK" -- migrate --caller "$SOURCE" || true
+    $STELLAR_BIN contract invoke --id "$CONTRACT_ID" --source "$SOURCE" --network "$NETWORK" -- migrate_schema --caller "$SOURCE" || true
     UPGRADE_EXECUTED=true
   fi
 

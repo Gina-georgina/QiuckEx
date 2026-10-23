@@ -1,21 +1,24 @@
-//! # Upgrade Simulation Test Harness — Issue #310 + #432
+//! # Upgrade Simulation Test Harness — Issue #310 + #432 + #450
 //!
 //! Creates a repeatable test harness that:
 //! 1. Deploys `LegacyV0Contract` (schema version 0) and populates a "golden state"
 //!    fixture covering escrows in multiple lifecycle states, fee configuration,
 //!    privacy settings, and the escrow counter.
 //! 2. Performs an in-place upgrade to `QuickexContract` (v1) via `env.register_at`,
-//!    then calls `migrate()`.
+//!    validates the schema version guard in `upgrade()`, and runs `migrate_schema()` / `migrate()`.
 //! 3. Validates all invariants and data integrity after the upgrade.
-//! 4. Provides regression tests for known migration pitfalls.
+//! 4. Provides regression tests for known migration pitfalls and schema version skips.
 //!
-//! ## Acceptance criteria (Issue #310 + #432)
+//! ## Acceptance criteria (Issue #310 + #432 + #450)
 //! - Upgrade tests run locally and deterministically.
 //! - No data loss or corruption across migrations.
 //! - Invariants are validated with clear failure messages.
 //! - Upgrade window gating works (blocks outside window).
 //! - Post-upgrade invariants enforced deterministically (AC2).
 //! - Upgrade start/complete events emitted for indexing (AC3).
+//! - `upgrade()` fails if the schema version gap > 1 (`new_version != old_version + 1`).
+//! - `migrate_schema()` transforms storage sequentially and is idempotent.
+//! - Upgrade safety gate includes schema version check in its pre-flight tests.
 //!
 //! ## Running
 //! ```sh
@@ -25,7 +28,10 @@
 
 use crate::{
     errors::QuickexError,
-    storage::{CURRENT_CONTRACT_VERSION, LEGACY_CONTRACT_VERSION, PRIVACY_ENABLED_KEY},
+    storage::{
+        CURRENT_CONTRACT_VERSION, LEGACY_CONTRACT_VERSION, LEGACY_SCHEMA_VERSION,
+        PRIVACY_ENABLED_KEY, SCHEMA_VERSION,
+    },
     types::FeeConfig,
     EscrowStatus, QuickexContract, QuickexContractClient,
 };
@@ -50,6 +56,10 @@ use soroban_sdk::{
 ///   so the persistent storage layout is identical.
 #[contract]
 pub struct LegacyV0Contract;
+
+impl LegacyV0Contract {
+    pub const SCHEMA_VERSION: u32 = LEGACY_SCHEMA_VERSION;
+}
 
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
@@ -887,4 +897,249 @@ fn upgrade_safety_gate_non_admin_blocked() {
     // Non-admin attempts set_upgrade_window → fails.
     let result = client.try_set_upgrade_window(&non_admin, &1u64, &0u64);
     assert!(result.is_err(), "set_upgrade_window by non-admin must fail");
+}
+
+// ============================================================================
+// Schema Version Guard & Migration Tests — Issue #450
+// ============================================================================
+
+/// Compatible sequential upgrade (`v0 -> v1`, gap == 1) succeeds through both
+/// `upgrade()` and the full upgrade safety gate ceremony (`start_upgrade` ->
+/// `upgrade` -> `complete_upgrade`).
+#[test]
+fn upgrade_safety_gate_compatible_upgrade_v0_to_v1() {
+    assert_eq!(LegacyV0Contract::SCHEMA_VERSION, 0);
+    assert_eq!(crate::SCHEMA_VERSION, 1);
+
+    let (env, gs) = build_golden_state();
+    let client = upgrade_to_current(&env, &gs.contract_id);
+
+    // Pre-migration schema version on-chain is 0 (legacy v0).
+    assert_eq!(client.get_schema_version(), LEGACY_SCHEMA_VERSION);
+
+    // Mark initialized so set_upgrade_window can configure the safety gate window
+    // while keeping stored schema_version at 0.
+    env.as_contract(&gs.contract_id, || {
+        crate::storage::set_initialized(&env, true);
+    });
+
+    client.set_upgrade_window(&gs.admin, &1u64, &0u64);
+
+    // Pre-flight check in start_upgrade accepts sequential target version 1 (0 + 1).
+    client.start_upgrade(&gs.admin, &SCHEMA_VERSION);
+
+    // upgrade() validates on-chain schema_version (0) vs incoming SCHEMA_VERSION (1).
+    let new_wasm_hash = BytesN::from_array(&env, &[0x45u8; 32]);
+    client.upgrade(&gs.admin, &new_wasm_hash);
+
+    // complete_upgrade() runs migrate_schema() and verifies post-upgrade invariants.
+    let migrated_version = client.complete_upgrade(&gs.admin, &SCHEMA_VERSION);
+    assert_eq!(migrated_version, SCHEMA_VERSION);
+    assert_eq!(client.get_schema_version(), SCHEMA_VERSION);
+    assert_eq!(client.get_version(), CURRENT_CONTRACT_VERSION);
+    assert_eq!(
+        client.get_deployment_metadata().wasm_hash,
+        Some(new_wasm_hash)
+    );
+}
+
+/// Incompatible schema version skip (`gap > 1`, e.g. `v0 -> v2`, `v0 -> v3`,
+/// `v1 -> v3`) or same-version re-upgrade (`v1 -> v1` in `upgrade()`) is rejected
+/// with `QuickexError::InvalidContractVersion`.
+#[test]
+fn upgrade_safety_gate_rejects_incompatible_schema_version_skip() {
+    let (env, gs) = build_golden_state();
+    let client = upgrade_to_current(&env, &gs.contract_id);
+
+    env.as_contract(&gs.contract_id, || {
+        crate::storage::set_initialized(&env, true);
+    });
+    client.set_upgrade_window(&gs.admin, &1u64, &0u64);
+
+    // 1. Pre-flight start_upgrade rejects version skip v0 -> v2 (gap = 2 > 1).
+    assert_eq!(
+        client.try_start_upgrade(&gs.admin, &2u32),
+        Err(Ok(QuickexError::InvalidContractVersion)),
+        "start_upgrade must reject schema version gap > 1 (0 -> 2)"
+    );
+
+    // 2. Pre-flight start_upgrade rejects version skip v0 -> v3 (gap = 3 > 1).
+    assert_eq!(
+        client.try_start_upgrade(&gs.admin, &3u32),
+        Err(Ok(QuickexError::InvalidContractVersion)),
+        "start_upgrade must reject schema version gap > 1 (0 -> 3)"
+    );
+
+    // 3. Direct upgrade() rejects when staged target version skips a version (0 -> 2).
+    env.as_contract(&gs.contract_id, || {
+        crate::storage::set_pending_upgrade_version(&env, 2);
+    });
+    let wasm_hash = BytesN::from_array(&env, &[0x99u8; 32]);
+    assert_eq!(
+        client.try_upgrade(&gs.admin, &wasm_hash),
+        Err(Ok(QuickexError::InvalidContractVersion)),
+        "upgrade() must abort when new_version != old_version + 1 (0 -> 2)"
+    );
+    env.as_contract(&gs.contract_id, || {
+        crate::storage::clear_pending_upgrade_version(&env);
+    });
+
+    // 4. Migrate to v1, then verify upgrade() rejects same-version (1 -> 1) and skip (1 -> 3).
+    client.migrate_schema(&gs.admin);
+    assert_eq!(client.get_schema_version(), SCHEMA_VERSION);
+
+    // Calling upgrade() with a v1 binary when already at v1 (1 != 1 + 1) must fail.
+    assert_eq!(
+        client.try_upgrade(&gs.admin, &wasm_hash),
+        Err(Ok(QuickexError::InvalidContractVersion)),
+        "upgrade() must reject when incoming binary version (1) != old_version (1) + 1"
+    );
+
+    // Pre-flight start_upgrade from v1 to v3 (gap = 2 > 1) must fail.
+    assert_eq!(
+        client.try_start_upgrade(&gs.admin, &3u32),
+        Err(Ok(QuickexError::InvalidContractVersion)),
+        "start_upgrade must reject schema version gap > 1 (1 -> 3)"
+    );
+
+    // Direct upgrade() with staged target version 3 from v1 (gap = 2 > 1) must fail.
+    env.as_contract(&gs.contract_id, || {
+        crate::storage::set_pending_upgrade_version(&env, 3);
+    });
+    assert_eq!(
+        client.try_upgrade(&gs.admin, &wasm_hash),
+        Err(Ok(QuickexError::InvalidContractVersion)),
+        "upgrade() must reject schema version gap > 1 (1 -> 3)"
+    );
+}
+
+/// `migrate_schema()` transforms storage from v0 to v1:
+/// - Sets `SchemaVersion` and `ContractVersion` to `1`
+/// - Seeds `Role::Admin`, `AdminSigners`, and `AdminThreshold`
+/// - Migrates legacy `(Symbol("privacy_enabled"), admin)` key into `DataKey::PrivacyEnabled(admin)`
+/// - `migrate_legacy_escrow_record` transforms legacy `DataKey::Escrow` into compact `DataKey::EscrowCore` + `DataKey::EscrowDispute`
+#[test]
+fn upgrade_safety_gate_migrate_schema_transforms_storage_correctly() {
+    let (env, gs) = build_golden_state();
+
+    // Seed legacy v0 artifacts:
+    // 1. Legacy Symbol-based privacy key for admin
+    // 2. Legacy DataKey::Escrow(commitment) record
+    let legacy_commitment = BytesN::from_array(&env, &[0x77u8; 32]);
+    let legacy_commitment_bytes: Bytes = legacy_commitment.clone().into();
+    env.as_contract(&gs.contract_id, || {
+        let legacy_privacy_key = (Symbol::new(&env, PRIVACY_ENABLED_KEY), gs.admin.clone());
+        env.storage().persistent().set(&legacy_privacy_key, &true);
+
+        let legacy_entry = crate::types::EscrowEntry {
+            token: gs.token.clone(),
+            amount_due: 5_000,
+            amount_paid: 5_000,
+            owner: gs.alice.clone(),
+            status: EscrowStatus::Pending,
+            created_at: 100,
+            expires_at: 500,
+            arbiter: Some(gs.arbiter.clone()),
+            arbiters: soroban_sdk::Vec::new(&env),
+            arbiter_threshold: 0,
+            memo: None,
+            milestones: soroban_sdk::Vec::new(&env),
+        };
+        env.storage().persistent().set(
+            &crate::storage::DataKey::Escrow(legacy_commitment_bytes.clone()),
+            &legacy_entry,
+        );
+    });
+
+    let client = upgrade_to_current(&env, &gs.contract_id);
+    assert_eq!(client.get_schema_version(), LEGACY_SCHEMA_VERSION);
+
+    let new_version = client.migrate_schema(&gs.admin);
+    assert_eq!(new_version, SCHEMA_VERSION);
+    assert_eq!(client.get_schema_version(), SCHEMA_VERSION);
+    assert_eq!(client.get_admin_signers().len(), 1);
+    assert_eq!(client.get_admin_threshold(), 1);
+    assert!(client.get_privacy(&gs.admin));
+
+    // Verify legacy privacy key was transformed to DataKey::PrivacyEnabled(admin)
+    // and legacy escrow record transforms cleanly to compact v1 storage.
+    env.as_contract(&gs.contract_id, || {
+        let legacy_privacy_key = (Symbol::new(&env, PRIVACY_ENABLED_KEY), gs.admin.clone());
+        assert!(
+            !env.storage().persistent().has(&legacy_privacy_key),
+            "legacy Symbol privacy key must be removed after migrate_schema"
+        );
+        assert_eq!(
+            env.storage()
+                .persistent()
+                .get::<_, bool>(&crate::storage::DataKey::PrivacyEnabled(gs.admin.clone())),
+            Some(true),
+            "DataKey::PrivacyEnabled must be populated after migrate_schema"
+        );
+
+        let migrated =
+            crate::storage::migrate_legacy_escrow_record(&env, &legacy_commitment_bytes);
+        assert!(migrated, "first legacy escrow migration must return true");
+        assert!(
+            !env.storage()
+                .persistent()
+                .has(&crate::storage::DataKey::Escrow(legacy_commitment_bytes.clone())),
+            "legacy DataKey::Escrow entry must be removed after transformation"
+        );
+        assert!(
+            env.storage()
+                .persistent()
+                .has(&crate::storage::DataKey::EscrowCore(legacy_commitment_bytes.clone())),
+            "compact DataKey::EscrowCore entry must exist after transformation"
+        );
+        assert!(
+            env.storage()
+                .persistent()
+                .has(&crate::storage::DataKey::EscrowDispute(legacy_commitment_bytes.clone())),
+            "DataKey::EscrowDispute entry must exist when arbiter is present"
+        );
+    });
+
+    let details = client
+        .get_escrow_details(&legacy_commitment, &gs.alice)
+        .expect("migrated escrow must be readable");
+    assert_eq!(details.amount_due, Some(5_000));
+    assert_eq!(details.owner, Some(gs.alice));
+    assert_eq!(details.arbiter, Some(gs.arbiter));
+}
+
+/// `migrate_schema()` is idempotent (safe to call multiple times without
+/// corrupting storage, altering escrow state, or failing).
+#[test]
+fn upgrade_safety_gate_migrate_schema_is_idempotent() {
+    let (env, gs) = build_golden_state();
+    let client = upgrade_to_current(&env, &gs.contract_id);
+
+    let v1 = client.migrate_schema(&gs.admin);
+    let v2 = client.migrate_schema(&gs.admin);
+    let v3 = client.migrate_schema(&gs.admin);
+
+    assert_eq!(v1, SCHEMA_VERSION);
+    assert_eq!(v2, SCHEMA_VERSION);
+    assert_eq!(v3, SCHEMA_VERSION);
+    assert_eq!(client.get_schema_version(), SCHEMA_VERSION);
+
+    // Escrow records and fee config remain completely intact after repeated calls.
+    assert_eq!(
+        client.get_commitment_state(&gs.commitment_pending),
+        Some(EscrowStatus::Pending)
+    );
+    assert_eq!(
+        client.get_commitment_state(&gs.commitment_disputed),
+        Some(EscrowStatus::Disputed)
+    );
+    assert_eq!(
+        client.get_commitment_state(&gs.commitment_spent),
+        Some(EscrowStatus::Spent)
+    );
+    assert_eq!(
+        client.get_commitment_state(&gs.commitment_refunded),
+        Some(EscrowStatus::Refunded)
+    );
+    assert_eq!(client.get_fee_config().fee_bps, gs.fee_bps);
 }

@@ -1,15 +1,15 @@
-# Issue #432: Upgrade Safety Gate Implementation Summary
+# Issue #432 & #450: Upgrade Safety Gate, Version Guard & Schema Migration Implementation Summary
 
 **Status**: Complete  
 **Complexity**: High (200 points)  
 **Wave**: 5 – Lifecycle Management  
-**Date**: May 29, 2026
+**Date**: May 29, 2026 (Updated for Issue #450)
 
 ---
 
 ## Overview
 
-Added contract-level safeguards and comprehensive invariant enforcement for safe, controlled upgrades in QuickEx. This implementation ensures upgrades only occur during admin-configured time windows and validates state machine consistency post-migration.
+Added contract-level safeguards, sequential schema version guards, idempotent storage schema migration, and comprehensive invariant enforcement for safe, controlled upgrades in QuickEx. This implementation ensures upgrades only occur during admin-configured time windows, prevents storage corruption by rejecting schema version skips (`new_version != old_version + 1`), and validates state machine consistency post-migration.
 
 ---
 
@@ -128,6 +128,47 @@ ORDER BY timestamp
 
 ---
 
+### AC4: Contract Upgrade Schema Version Guard (Issue #450) ✅
+
+**What**: Each contract binary defines a `SCHEMA_VERSION: u32` constant. During pre-flight (`start_upgrade`) and WASM swap (`upgrade`), the contract reads the stored on-chain `schema_version` and compares it with the incoming binary's expected `SCHEMA_VERSION` (or staged target version). If `new_version != old_version + 1` (e.g., version gap > 1, same-version re-upgrade, or downgrade), `upgrade()` aborts with `QuickexError::InvalidContractVersion` (`314`).
+
+**Implementation**:
+- Constant: `pub const SCHEMA_VERSION: u32 = 1;` in `quickex` (`storage.rs` & `lib.rs`) and `escrow` (`lib.rs`), and `LegacyV0Contract::SCHEMA_VERSION = 0` in `upgrade_test.rs`
+- Storage key: `DataKey::SchemaVersion` (synchronized with `DataKey::ContractVersion`)
+- Guard function: `admin::validate_schema_version(old_version, new_version)` enforces `new_version == old_version.checked_add(1)`
+- Entrypoints guarded:
+  - `QuickexContract::upgrade(env, caller, new_wasm_hash)`
+  - `QuickexContract::start_upgrade(env, caller, new_version)` (pre-flight check)
+  - `GovernanceAction::Upgrade(wasm_hash, version)` in `governance.rs`
+  - `EscrowContract::upgrade(env, caller, new_wasm_hash, new_version)`
+  - Pre-flight check in `scripts/testnet-upgrade-rehearsal.sh`
+
+**Tests**:
+- `upgrade_safety_gate_compatible_upgrade_v0_to_v1`
+- `upgrade_safety_gate_rejects_incompatible_schema_version_skip`
+
+---
+
+### AC5: Sequential & Idempotent Schema Migration (`migrate_schema`) (Issue #450) ✅
+
+**What**: `migrate_schema()` transforms on-chain storage sequentially from `old_version` to `SCHEMA_VERSION` one version step at a time (`v0 -> v1`) and is safe to call multiple times (idempotent).
+
+**Implementation**:
+- `QuickexContract::migrate_schema(env, caller)` and `QuickexContract::get_schema_version(env)`
+- `admin::migrate_schema(env, caller)`:
+  - Steps sequentially through `migrate_v0_to_v1(env)` while `version < storage::SCHEMA_VERSION`
+  - Seeds `Role::Admin`, `AdminSigners`, and `AdminThreshold` for legacy v0 deployments
+  - Transforms legacy `(Symbol("privacy_enabled"), admin)` records into `DataKey::PrivacyEnabled(admin)`
+  - `storage::migrate_legacy_escrow_record(env, commitment)` transforms legacy `DataKey::Escrow` records into compact `DataKey::EscrowCore` + `DataKey::EscrowDispute` records
+  - Updates `DataKey::SchemaVersion` and `DataKey::ContractVersion` and runs `assert_post_upgrade_invariants(env)`
+  - Idempotent: subsequent calls at `SCHEMA_VERSION` are no-ops that validate invariants and return `Ok(SCHEMA_VERSION)` without re-emitting `ContractMigrated`
+
+**Tests**:
+- `upgrade_safety_gate_migrate_schema_transforms_storage_correctly`
+- `upgrade_safety_gate_migrate_schema_is_idempotent`
+
+---
+
 ## Implementation Details
 
 ### Files Modified
@@ -156,12 +197,15 @@ ORDER BY timestamp
 
 ### New Public Entrypoints
 
-| Function | Admin-Only | Window-Gated | Emits Event |
-|----------|-----------|--------------|-------------|
-| `set_upgrade_window(start, end)` | ✅ | ❌ | ❌ |
-| `get_upgrade_window()` | ❌ | ❌ | ❌ |
-| `start_upgrade(new_version)` | ✅ | ✅ | ✅ `UpgradeStarted` |
-| `complete_upgrade(new_version)` | ✅ | ❌ | ✅ `UpgradeCompleted` |
+| Function | Admin-Only | Window-Gated | Version-Guarded | Emits Event |
+|----------|-----------|--------------|-----------------|-------------|
+| `set_upgrade_window(start, end)` | ✅ | ❌ | ❌ | ✅ `UpgradeWindowChanged` |
+| `get_upgrade_window()` | ❌ | ❌ | ❌ | ❌ |
+| `get_schema_version()` | ❌ | ❌ | ❌ | ❌ |
+| `start_upgrade(new_version)` | ✅ | ✅ | ✅ (gap ≤ 1) | ✅ `UpgradeStarted` |
+| `upgrade(caller, new_wasm_hash)` | ✅ | ❌ | ✅ (`new == old + 1`) | ✅ `ContractUpgraded` |
+| `migrate_schema(caller)` | ✅ | ❌ | ✅ (sequential & idempotent) | ✅ `ContractMigrated` |
+| `complete_upgrade(new_version)` | ✅ | ❌ | ✅ (`migrate_schema` + invariants) | ✅ `UpgradeCompleted` |
 
 ---
 
@@ -202,15 +246,20 @@ Step 3b: Admin calls complete_upgrade(new_version)
 
 All tests use the `GoldenState` fixture (legacy v0 contract pre-populated with escrows, fees, privacy flags).
 
-**Test Suite: `upgrade_safety_gate_*`** (5 tests)
+**Test Suite: `upgrade_safety_gate_*`** (9 tests)
 
-| Test Name | Lines | What It Validates |
-|-----------|-------|-------------------|
-| `blocks_upgrade_outside_window` | 660–703 | AC1: window gating |
-| `post_upgrade_invariants_enforced` | 705–737 | AC2: invariant validation |
-| `emits_events` | 739–770 | AC3: event emission |
-| `blocks_double_start` | 772–798 | Safety: concurrent upgrades blocked |
-| `non_admin_blocked` | 800–820 | Security: admin-only enforcement |
+| Test Name | What It Validates |
+|-----------|-------------------|
+| `blocks_upgrade_outside_window` | AC1: window gating |
+| `post_upgrade_invariants_enforced` | AC2: invariant validation |
+| `invariant_failure_deterministic` | AC2: deterministic rollback on invariant failure |
+| `emits_events` | AC3: event emission |
+| `blocks_double_start` | Safety: concurrent upgrades blocked |
+| `non_admin_blocked` | Security: admin-only enforcement |
+| `compatible_upgrade_v0_to_v1` | Issue #450: sequential upgrade (`v0 -> v1`) succeeds |
+| `rejects_incompatible_schema_version_skip` | Issue #450: schema version gap > 1 (`v0 -> v2`, `v0 -> v3`, `v1 -> v3`) rejected |
+| `migrate_schema_transforms_storage_correctly` | Issue #450: storage transformation from v0 to v1 |
+| `migrate_schema_is_idempotent` | Issue #450: `migrate_schema()` safe to call multiple times |
 
 **Run Tests**:
 ```bash

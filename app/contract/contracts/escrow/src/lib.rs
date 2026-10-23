@@ -2,11 +2,23 @@
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol};
 
+/// Expected on-chain storage schema version for this contract binary (Issue #450).
+pub const SCHEMA_VERSION: u32 = 1;
+pub const LEGACY_SCHEMA_VERSION: u32 = 0;
+
 /// Storage key for an individual escrow entry.
 #[contracttype]
 #[derive(Clone)]
 pub struct EscrowKey {
     pub escrow_id: u64,
+}
+
+/// Singleton metadata keys for schema versioning and upgrades.
+#[contracttype]
+#[derive(Clone)]
+pub enum MetadataKey {
+    SchemaVersion,
+    WasmHash,
 }
 
 /// A single escrow entry tracked by the contract.
@@ -34,6 +46,7 @@ pub enum EscrowError {
     Unauthorized = 5,
     InvalidAmount = 6,
     InvalidTtl = 7,
+    InvalidSchemaVersion = 8,
 }
 
 const ESCROW: Symbol = symbol_short!("ESCROW");
@@ -155,6 +168,65 @@ impl EscrowContract {
         let key = EscrowKey { escrow_id };
         env.storage().persistent().get(&key)
     }
+
+    /// Return the stored on-chain schema version (`0` for legacy deployments).
+    pub fn get_schema_version(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&MetadataKey::SchemaVersion)
+            .unwrap_or(LEGACY_SCHEMA_VERSION)
+    }
+
+    /// Upgrade contract WASM with sequential schema version guard (`new_version == old_version + 1`).
+    pub fn upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: BytesN<32>,
+        new_version: u32,
+    ) -> Result<(), EscrowError> {
+        caller.require_auth();
+        let old_version = Self::get_schema_version(env.clone());
+        match old_version.checked_add(1) {
+            Some(expected) if new_version == expected => {}
+            _ => return Err(EscrowError::InvalidSchemaVersion),
+        }
+
+        env.storage()
+            .persistent()
+            .set(&MetadataKey::WasmHash, &new_wasm_hash);
+        #[cfg(not(test))]
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash);
+        Ok(())
+    }
+
+    /// Transform storage sequentially from the stored schema version to `SCHEMA_VERSION`.
+    /// Idempotent: safe to call multiple times.
+    pub fn migrate_schema(env: Env, caller: Address) -> Result<u32, EscrowError> {
+        caller.require_auth();
+        let from_version = Self::get_schema_version(env.clone());
+        if from_version > SCHEMA_VERSION {
+            return Err(EscrowError::InvalidSchemaVersion);
+        }
+
+        let mut version = from_version;
+        while version < SCHEMA_VERSION {
+            version = match version {
+                LEGACY_SCHEMA_VERSION => {
+                    env.storage()
+                        .persistent()
+                        .set(&MetadataKey::SchemaVersion, &SCHEMA_VERSION);
+                    SCHEMA_VERSION
+                }
+                _ => return Err(EscrowError::InvalidSchemaVersion),
+            };
+        }
+
+        env.storage()
+            .persistent()
+            .set(&MetadataKey::SchemaVersion, &version);
+        Ok(version)
+    }
 }
 
 #[cfg(test)]
@@ -219,5 +291,27 @@ mod test {
         env.ledger().set_sequence_number(100);
         let result = client.try_release_escrow(&1, &condition_hash);
         assert_eq!(result, Err(Ok(EscrowError::AlreadyExpired)));
+    }
+
+    #[test]
+    fn upgrade_version_guard_and_idempotent_migrate_schema() {
+        let (env, client, sender, _recipient, _condition_hash) = setup();
+        let wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+
+        assert_eq!(client.get_schema_version(), LEGACY_SCHEMA_VERSION);
+
+        // Incompatible skip (0 -> 2, gap > 1) rejected
+        assert_eq!(
+            client.try_upgrade(&sender, &wasm_hash, &2),
+            Err(Ok(EscrowError::InvalidSchemaVersion))
+        );
+
+        // Compatible sequential upgrade (0 -> 1) accepted
+        client.upgrade(&sender, &wasm_hash, &SCHEMA_VERSION);
+
+        // migrate_schema transforms v0 -> v1 and is idempotent on repeat calls
+        assert_eq!(client.migrate_schema(&sender), SCHEMA_VERSION);
+        assert_eq!(client.migrate_schema(&sender), SCHEMA_VERSION);
+        assert_eq!(client.get_schema_version(), SCHEMA_VERSION);
     }
 }
