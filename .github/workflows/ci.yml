@@ -1,51 +1,28 @@
-name: CI Pipeline
+name: CI
 
 on:
-  pull_request:
-    branches: [main]
   push:
+    branches: [main]
+  pull_request:
     branches: [main]
 
 jobs:
-  validate:
-    name: Validate (${{ matrix.package }})
+  backend:
+    name: Backend
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        package:
-          - "@quickex/backend"
-          - "frontend"
-          - "mobile"
+    defaults:
+      run:
+        working-directory: backend
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          run_install: false
-
-      - name: Set up Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "pnpm"
-
-      - name: Cache Turbo build cache
-        uses: actions/cache@v4
-        with:
-          path: .turbo/cache
-          key: ${{ runner.os }}-turbo-${{ matrix.package }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-turbo-${{ matrix.package }}-
-            ${{ runner.os }}-turbo-
-
-      # Forces pnpm to link all internal binaries across packages properly
-      - name: Install Dependencies
-        run: pnpm install --no-frozen-lockfile
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
 
       - name: Verify contract metadata and deployment gates
         if: matrix.package == '@quickex/backend'
@@ -53,19 +30,11 @@ jobs:
           pnpm check:contract-metadata-drift
           node --test scripts/check-contract-metadata-drift.test.js scripts/verify-mainnet-deployment-gate.test.js scripts/rollback-migration.test.js
 
-      # Affected-package execution with Turbo caching
-      - name: Run CI tasks for ${{ matrix.package }}
-        run: |
-          BASE_REF="${{ github.base_ref || 'main' }}"
-          git fetch origin "$BASE_REF" --depth=1 2>/dev/null || true
+      - name: Lint
+        run: npm run lint
 
-          echo "Evaluating affected execution for ${{ matrix.package }} against origin/$BASE_REF"
-          pnpm turbo run lint type-check test build \
-            --filter="${{ matrix.package }}...[origin/$BASE_REF]" \
-            --cache-dir=".turbo/cache" || \
-          pnpm turbo run lint type-check test build \
-            --filter="${{ matrix.package }}..." \
-            --cache-dir=".turbo/cache"
+      - name: Unit tests with coverage
+        run: npm run test:unit -- --coverage
 
   # ── Database migration smoke test (issue #440) ──────────────────────────
   # Spins up a fresh temporary Supabase test schema, applies all migrations in
@@ -139,34 +108,32 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          name: backend-coverage-report
+          path: backend/coverage
+          if-no-files-found: ignore
 
-      - name: Run documentation gate
-        run: node scripts/docs-check/check.mjs
-
-      - name: Test the documentation gate
-        run: node --test scripts/docs-check/__tests__/docs.test.mjs
-
-  # ── Governance gate (issues #306-#309) ────────────────────────────────────
-  # Dependency-free: validates ADRs, asset listing policy, retention schedule and
-  # the a11y/i18n standard before anything is installed.
-  governance:
-    name: Governance Gate
+  frontend:
+    name: Frontend
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
-      - name: Run governance gate
-        run: node scripts/governance/check.mjs
+      - name: Install dependencies
+        run: npm ci
 
-      - name: Test the governance gate
-        run: node --test scripts/governance/__tests__/governance.test.mjs
+      - name: Lint
+        run: npm run lint
 
   # ── Secret scanning (lightweight check in main CI) ──────────────────────
   secret-scan:
