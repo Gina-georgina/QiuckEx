@@ -27,6 +27,23 @@ UPDATE verified_assets SET listing_tier = 'verified' WHERE code IN ('USDC', 'AQU
 UPDATE verified_assets SET listing_tier = 'community' WHERE code = 'yXLM' AND listing_tier IS NULL;
 UPDATE verified_assets SET listing_tier = 'unlisted' WHERE listing_tier IS NULL;
 
+CREATE INDEX IF NOT EXISTS idx_verified_assets_listing_status
+  ON verified_assets (listing_status);
+
+CREATE TABLE IF NOT EXISTS asset_listing_evidence (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  asset_key VARCHAR(70) NOT NULL, -- CODE or CODE:ISSUER
+  kind VARCHAR(40) NOT NULL,      -- toml_document | attestation_of_reserve | ...
+  expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  evidence_ref VARCHAR(120),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+  UNIQUE (asset_key, kind)
+);
+
+CREATE INDEX IF NOT EXISTS idx_asset_listing_evidence_expiry
+  ON asset_listing_evidence (expires_at);
+
 -- Evidence grace seeding: rows verified under the pre-policy model get one
 -- grace period per required evidence kind so enforcement starts as a *review*
 -- deadline, not an instant delisting. Renewal (or suspension) follows the
@@ -57,24 +74,6 @@ DELETE FROM asset_listing_evidence e
      (a.listing_tier = 'community' AND e.kind <> 'toml_document')
      OR (a.listing_tier IN ('native', 'unlisted'))
    );
-
-
-CREATE INDEX IF NOT EXISTS idx_verified_assets_listing_status
-  ON verified_assets (listing_status);
-
-CREATE TABLE IF NOT EXISTS asset_listing_evidence (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  asset_key VARCHAR(70) NOT NULL, -- CODE or CODE:ISSUER
-  kind VARCHAR(40) NOT NULL,      -- toml_document | attestation_of_reserve | ...
-  expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-  evidence_ref VARCHAR(120),
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
-  UNIQUE (asset_key, kind)
-);
-
-CREATE INDEX IF NOT EXISTS idx_asset_listing_evidence_expiry
-  ON asset_listing_evidence (expires_at);
 
 CREATE TABLE IF NOT EXISTS asset_listing_decisions (
   id UUID PRIMARY KEY,
