@@ -1,3 +1,5 @@
+import { Logger } from '@nestjs/common';
+
 /**
  * Sentry instrumentation file.
  * This file MUST be imported before any other modules in main.ts
@@ -159,10 +161,10 @@ if (SENTRY_DSN) {
     ],
   });
 } else {
-  // eslint-disable-next-line no-console
-  console.warn(
+  Logger.warn(
     '[Sentry] SENTRY_DSN not set — error monitoring is disabled. ' +
       'Set SENTRY_DSN in your environment to enable Sentry.',
+    'Sentry',
   );
 }
 
