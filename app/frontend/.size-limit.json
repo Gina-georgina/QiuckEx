@@ -1,0 +1,30 @@
+[
+  {
+    "name": "app bundle",
+    "path": ".next/static/chunks/**/*.js",
+    "limit": "300 kB",
+    "gzip": true,
+    "running": false
+  },
+  {
+    "name": "route: /",
+    "path": ".next/static/chunks/pages/index-*.js",
+    "limit": "150 kB",
+    "gzip": true,
+    "running": false
+  },
+  {
+    "name": "route: /dashboard",
+    "path": ".next/static/chunks/pages/dashboard-*.js",
+    "limit": "150 kB",
+    "gzip": true,
+    "running": false
+  },
+  {
+    "name": "route: /settings",
+    "path": ".next/static/chunks/pages/settings-*.js",
+    "limit": "150 kB",
+    "gzip": true,
+    "running": false
+  }
+]

@@ -4,19 +4,23 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { ThemedText } from "../themed-text";
 import { useNetworkStatus } from "../../hooks/use-network-status";
+import { useTheme } from "../../src/theme/ThemeContext";
 
 /**
  * A banner that appears at the top of the screen when the device is offline.
  */
 export function OfflineBanner() {
-  const { isConnected } = useNetworkStatus();
+  const { isConnected, isInternetReachable } = useNetworkStatus();
   const insets = useSafeAreaInsets();
+  const { theme } = useTheme();
 
-  // Custom colors for the banner
-  const backgroundColor = "#FF8C00"; // Darker orange for visibility
-  const textColor = "#FFFFFF";
+  // Offline banner uses warning colours from the theme
+  const backgroundColor = theme.status.warning;
+  const textColor = theme.buttonPrimaryText;
 
-  if (isConnected !== false) {
+  const isOffline = isConnected === false || isInternetReachable === false;
+
+  if (!isOffline) {
     return null;
   }
 
@@ -27,7 +31,7 @@ export function OfflineBanner() {
       <View style={styles.content}>
         <Ionicons name="cloud-offline" size={20} color={textColor} />
         <ThemedText style={[styles.text, { color: textColor }]}>
-          You are currently offline. Some features may be unavailable.
+          You are currently offline. "Read Mode" enabled for cached data.
         </ThemedText>
       </View>
     </View>

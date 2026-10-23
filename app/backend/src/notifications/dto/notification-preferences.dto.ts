@@ -8,6 +8,7 @@ import {
   IsIn,
   IsNumber,
   Min,
+  ValidateNested,
 } from "class-validator";
 import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
 import { Transform, Type } from "class-transformer";
@@ -17,13 +18,29 @@ import type {
   NotificationEventType,
 } from "../types/notification.types";
 
-const VALID_CHANNELS: NotificationChannel[] = ["email", "push", "webhook"];
+export const VALID_CHANNELS: NotificationChannel[] = [
+  "email",
+  "telegram",
+  "push",
+  "webhook",
+];
 const VALID_EVENTS: NotificationEventType[] = [
   "EscrowDeposited",
   "EscrowWithdrawn",
   "EscrowRefunded",
   "payment.received",
   "username.claimed",
+  "recurring.payment.due",
+  "recurring.payment.executed",
+  "recurring.payment.failed",
+  "recurring.payment.cancelled",
+  "recurring.link.created",
+  "recurring.link.updated",
+  "recurring.link.paused",
+  "recurring.link.resumed",
+  "recurring.link.completed",
+  "auto_reconciliation.succeeded",
+  "payment.link.expired",
 ];
 
 export class UpsertNotificationPreferenceDto {
@@ -45,6 +62,15 @@ export class UpsertNotificationPreferenceDto {
   @IsOptional()
   @IsUrl()
   webhookUrl?: string;
+
+  @ApiPropertyOptional({
+    example: "whsec_xxxxxxxxxxxxxxxx",
+    description:
+      "Secret key for HMAC-SHA256 payload signing. If not provided, one will be generated automatically.",
+  })
+  @IsOptional()
+  @IsString()
+  webhookSecret?: string;
 
   @ApiPropertyOptional({
     type: [String],
@@ -77,6 +103,14 @@ export class UpsertNotificationPreferenceDto {
   enabled?: boolean;
 }
 
+export class UpdateNotificationPreferencesDto {
+  @ApiProperty({ type: [UpsertNotificationPreferenceDto] })
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => UpsertNotificationPreferenceDto)
+  preferences!: UpsertNotificationPreferenceDto[];
+}
+
 export class DisableChannelDto {
   @ApiProperty({ enum: VALID_CHANNELS })
   @IsIn(VALID_CHANNELS)
@@ -90,6 +124,12 @@ export class NotificationPreferenceResponseDto {
   @ApiPropertyOptional() email?: string;
   @ApiPropertyOptional() pushToken?: string;
   @ApiPropertyOptional() webhookUrl?: string;
+  @ApiPropertyOptional({
+    example: "whsec_xxxxxxxxxxxxxxxx",
+    description:
+      "Secret key for HMAC-SHA256 payload signing (only for webhook channel, masked on read)",
+  })
+  webhookSecret?: string;
   @ApiPropertyOptional({ type: [String], nullable: true }) events!:
     | NotificationEventType[]
     | null;

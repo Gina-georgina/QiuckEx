@@ -4,20 +4,31 @@ import {
   ExceptionFilter,
   HttpException,
   HttpStatus,
+  Logger,
 } from "@nestjs/common";
 import { ThrottlerException } from "@nestjs/throttler";
-import { Response } from "express";
+import { Request, Response } from "express";
 import { AppConfigService } from "../../config";
+import { MetricsService } from "../../metrics/metrics.service";
+import { getCorrelationId } from "../context/correlation-id.context";
 
 interface ErrorResponseBody {
   success: false;
   error: {
     code: string;
     message: string | string[];
+    /** Stable trace identifier — always present on every error response. */
+    traceId?: string;
+    /** Stable alias for traceId — used by clients to trace requests */
+    request_id?: string;
+    correlationId?: string;
     fields?: unknown;
     details?: unknown;
   };
 }
+
+const DEFAULT_CODE = "INTERNAL_ERROR";
+const DEFAULT_MESSAGE = "An unexpected error occurred";
 
 type ValidationExceptionPayload = {
   code: "VALIDATION_ERROR";
@@ -38,22 +49,66 @@ type HttpExceptionResponse =
 
 @Catch()
 export class GlobalHttpExceptionFilter implements ExceptionFilter {
-  constructor(private readonly config: AppConfigService) {}
+  private readonly logger = new Logger(GlobalHttpExceptionFilter.name);
+
+  constructor(
+    private readonly config: AppConfigService,
+    private readonly metricsService?: MetricsService,
+  ) {}
 
   catch(exception: unknown, host: ArgumentsHost): void {
     const ctx = host.switchToHttp();
     const response = ctx.getResponse<Response>();
+    const request = ctx.getRequest<Request>();
     const isProduction = this.config.isProduction;
 
+    // Extract correlation ID for traceability, falling back to the
+    // async-local context when the request-scoped value is missing.
+    const correlationId =
+      ((request as Record<string, unknown>)["correlationId"] as
+        | string
+        | undefined) ?? getCorrelationId();
+
+    // Always emit the correlation ID response header before writing the body.
+    if (correlationId) {
+      response.setHeader("X-Correlation-ID", correlationId);
+      response.setHeader("x-request-id", correlationId);
+      response.setHeader("x-correlation-id", correlationId);
+    }
+
     let status: number = HttpStatus.INTERNAL_SERVER_ERROR;
-    let code = "INTERNAL_SERVER_ERROR";
-    let message: string | string[] = "An unexpected error occurred";
+    let code = DEFAULT_CODE;
+    let message: string | string[] = DEFAULT_MESSAGE;
     let details: unknown = undefined;
 
     if (exception instanceof ThrottlerException) {
       status = HttpStatus.TOO_MANY_REQUESTS;
       code = "RATE_LIMIT_EXCEEDED";
-      message = "Too many requests. Please try again later.";
+      const retryAfterSeconds = this.getRetryAfterSeconds(response);
+
+      message =
+        retryAfterSeconds > 0
+          ? `Too many requests. Retry after ${retryAfterSeconds} seconds.`
+          : "Too many requests. Please try again later.";
+
+      details = {
+        retryAfterSeconds,
+      };
+
+      const reqRecord = request as Record<string, unknown>;
+      const rateLimitContext =
+        (reqRecord["rateLimitContext"] as
+          | { group?: string; keyType?: string }
+          | undefined) ?? {};
+
+      const route = this.resolveRoute(request);
+
+      this.metricsService?.recordRateLimitedRequest(
+        request.method,
+        route,
+        rateLimitContext.group ?? "public",
+        rateLimitContext.keyType ?? "ip",
+      );
     } else if (exception instanceof HttpException) {
       status = exception.getStatus();
       const res = exception.getResponse() as HttpExceptionResponse;
@@ -71,6 +126,9 @@ export class GlobalHttpExceptionFilter implements ExceptionFilter {
               code: "VALIDATION_ERROR",
               message: validation.message ?? "Validation failed",
               fields: validation.fields ?? [],
+              traceId: correlationId ?? "unknown",
+              request_id: correlationId ?? "unknown",
+              correlationId: correlationId ?? "unknown",
             },
           });
         }
@@ -87,6 +145,12 @@ export class GlobalHttpExceptionFilter implements ExceptionFilter {
       }
     } else if (exception instanceof Error) {
       message = isProduction ? "Internal server error" : exception.message;
+
+      // Log the full stack for server errors
+      this.logger.error(
+        `Unhandled exception: ${exception.message}`,
+        exception.stack,
+      );
     }
 
     const body: ErrorResponseBody = {
@@ -94,10 +158,34 @@ export class GlobalHttpExceptionFilter implements ExceptionFilter {
       error: {
         code,
         message,
+        traceId: correlationId ?? "unknown",
+        request_id: correlationId ?? "unknown",
+        correlationId: correlationId ?? "unknown",
         ...(details && !isProduction ? { details } : {}),
       },
     };
 
     response.status(status).json(body);
+  }
+
+  private getRetryAfterSeconds(response: Response): number {
+    const retryAfter = response.getHeader("Retry-After");
+    if (typeof retryAfter === "string") {
+      const parsed = Number(retryAfter);
+      if (!Number.isNaN(parsed) && parsed >= 0) return parsed;
+    }
+
+    return 0;
+  }
+
+  private resolveRoute(request: Request): string {
+    const routePath = request.route?.path;
+    const baseUrl = request.baseUrl ?? "";
+
+    if (typeof routePath === "string" && routePath.length > 0) {
+      return `${baseUrl}${routePath}`;
+    }
+
+    return request.path ?? request.url;
   }
 }

@@ -9,6 +9,14 @@ export interface TransactionItem {
   timestamp: string;
   txHash: string;
   pagingToken: string;
+  source: string;
+  destination: string;
+  status: "Success" | "Pending";
+  /**
+   * Payment direction relative to the connected account.
+   * Derived client-side: 'sent' if source matches accountId, 'received' otherwise.
+   */
+  direction?: "sent" | "received";
 }
 
 /**
@@ -17,4 +25,40 @@ export interface TransactionItem {
 export interface TransactionResponse {
   items: TransactionItem[];
   nextCursor?: string;
+}
+
+/**
+ * Transaction-related types for receipt metadata
+ */
+
+export interface StellarTransaction {
+  id: string;
+  pagingToken: string;
+  successful: boolean;
+  hash: string;
+  ledger: number;
+  createdAt: string;
+  sourceAccount: string;
+  sourceAccountSequence: string;
+  feeCharged: string;
+  maxFee: string;
+  operationCount: number;
+  memoType?: string;
+  memo?: string;
+  signatures: string[];
+}
+
+export interface SorobanContractEvent {
+  id: string;
+  type: string;
+  ledger: number;
+  timestamp: string;
+  contractId: string;
+  topic: string[];
+  value: Record<string, unknown>;
+}
+
+export interface HorizonLink {
+  href: string;
+  templated?: boolean;
 }

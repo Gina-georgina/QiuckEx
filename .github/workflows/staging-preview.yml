@@ -1,0 +1,149 @@
+name: Staging Preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+concurrency:
+  group: staging-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  STELLAR_NETWORK: testnet
+  PREVIEW_SLUG: pr-${{ github.event.pull_request.number }}
+
+jobs:
+  guard:
+    name: Enforce testnet-only staging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify STELLAR_NETWORK is testnet
+        run: |
+          if [ "${STELLAR_NETWORK}" != "testnet" ]; then
+            echo "::error::Staging must use STELLAR_NETWORK=testnet (got '${STELLAR_NETWORK}')"
+            exit 1
+          fi
+      - name: Block mainnet feature flags
+        run: |
+          if [ -n "${MAINNET_ENABLED:-}" ] || [ -n "ENABLE_MAINNET:-}" ] || [ -n "NEXT_PUBLIC_MAINNET:-}" ]; then
+            echo "::error::Mainnet feature flags must not be set in staging"
+            exit 1
+          fi
+
+  deploy:
+    name: Deploy preview
+    needs: guard
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    outputs:
+      frontend_url: ${{ steps.frontend.outputs.url }}
+      backend_url: ${{ steps.backend.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy frontend (Vercel preview)
+        id: frontend
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          npm i -g vercel@latest
+          url=$(vercel deploy --token "$VERCEL_TOKEN" \
+            --scope "$VERCEL_ORG_ID" \
+            --meta githubPrId="${{ github.event.pull_request.number }}" \
+            --env STELLAR_NETWORK=testnet \
+            --yes)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy backend (staging service)
+        id: backend
+        env:
+          STAGING_DEPLOY_HOOK: ${{ secrets.STAGING_BACKEND_DEPLOY_HOOK }}
+        run: |
+          url="https://api-${PREVIEW_SLUG}.staging.example.com"
+          if [ -n "$STAGING_DEPLOY_HOOK" ]; then
+            curl -fsSL -X POST "$STAGING_DEPLOY_HOOK" \
+              -H 'Content-Type: application/json' \
+              -d "{\"slug\":\"${PREVIEW_SLUG}\",\"stellar_network\":\"testnet\"}"
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Health check
+        id: health
+        run: |
+          status="unknown"
+          for i in $(seq 1 12); do
+            if curl -fsS "${{ steps.backend.outputs.url }}/health" >/dev/null 2>&1; then
+              status="healthy"
+              break
+            fi
+            sleep 5
+          done
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Comment preview URL on PR
+        uses: actions/github-script@v7
+        env:
+          FRONTEND_URL: ${{ steps.frontend.outputs.url }}
+          BACKEND_URL: ${{ steps.backend.outputs.url }}
+          HEALTH: ${{ steps.health.outputs.status }}
+        with:
+          script: |
+            const marker = '<!-- staging-preview -->';
+            const body = [
+              marker,
+              '## Staging preview',
+              '',
+              `- Frontend: ${process.env.FRONTEND_URL}`,
+              `- Backend: ${process.env.BACKEND_URL}`,
+              `- Health: ${process.env.HEALTH}`,
+              `- Network: testnet`,
+            ].join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  teardown:
+    name: Tear down preview
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove frontend preview
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          npm i -g vercel@latest
+          vercel remove "$PREVIEW_SLUG" --token "$VERCEL_TOKEN" --yes || true
+
+      - name: Remove backend staging service
+        env:
+          STAGING_TEARDOWN_HOOK: ${{ secrets.STAGING_BACKEND_TEARDOWN_HOOK }}
+        run: |
+          if [ -n "$STAGING_TEARDOWN_HOOK" ]; then
+            curl -fsSL -X POST "$STAGING_TEARDOWN_HOOK" \
+              -H 'Content-Type: application/json' \
+              -d "{\"slug\":\"${PREVIEW_SLUG}\"}" || true
+          fi

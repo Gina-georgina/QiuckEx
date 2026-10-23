@@ -1,10 +1,22 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { LinkConstraints, AssetCode, MemoType } from './constants';
 import { LinkMetadataRequestDto, LinkMetadataResponseDto } from '../dto';
 import { LinkValidationError, LinkErrorCode } from './errors';
+import {
+  PathPreviewService,
+  type PathPreviewRow,
+} from '../stellar/path-preview.service';
+import { PrivacyService } from '../privacy/privacy.service';
 
 @Injectable()
 export class LinksService {
+  private readonly logger = new Logger(LinksService.name);
+
+  constructor(
+    @Optional() private readonly pathPreviewService?: PathPreviewService,
+    @Optional() private readonly privacyService?: PrivacyService,
+  ) {}
+
   async generateMetadata(request: LinkMetadataRequestDto): Promise<LinkMetadataResponseDto> {
     const amt = this.validateAmount(request.amount);
 
@@ -22,7 +34,21 @@ export class LinksService {
     // Normalize asset symbol to canonical form
     const normalizedAsset = this.normalizeAssetSymbol(asset);
 
-    const canonical = this.generateCanonicalFormat(amt, normalizedAsset, memo, username, destination, referenceId);
+    // Validate and normalise acceptedAssets
+    const acceptedAssets = this.validateAcceptedAssets(
+      request.acceptedAssets,
+      normalizedAsset,
+    );
+
+    const canonical = this.generateCanonicalFormat(
+      amt,
+      normalizedAsset,
+      memo,
+      username,
+      destination,
+      referenceId,
+      acceptedAssets,
+    );
 
     const warnings: string[] = [];
     let normalized = false;
@@ -44,6 +70,22 @@ export class LinksService {
 
     // Additional metadata fields for frontend
     const additionalMetadata = this.deriveAdditionalMetadata(request, normalizedAsset);
+    const stealthRecipientEnvelope =
+      request.privacy &&
+      request.recipientViewPublicKeyPem &&
+      destination &&
+      this.privacyService
+        ? this.privacyService.encryptRecipientForViewKey(
+            destination,
+            request.recipientViewPublicKeyPem,
+          )
+        : undefined;
+
+    // Compute swap options for accepted assets that differ from the destination asset
+    let swapOptions: PathPreviewRow[] | null = null;
+    if (acceptedAssets) {
+      swapOptions = await this.buildSwapOptions(amt, normalizedAsset, acceptedAssets);
+    }
 
     return {
       amount: amt,
@@ -56,9 +98,12 @@ export class LinksService {
       username,
       destination,
       referenceId,
+      acceptedAssets,
+      swapOptions,
       metadata: {
         normalized,
         warnings: warnings.length > 0 ? warnings : undefined,
+        stealthRecipientEnvelope,
         ...additionalMetadata,
       },
     };
@@ -268,6 +313,63 @@ export class LinksService {
     return normalized[asset] || asset;
   }
 
+  private validateAcceptedAssets(
+    assets: string[] | undefined,
+    destinationAsset: string,
+  ): string[] | null {
+    if (!assets || assets.length === 0) {
+      return null;
+    }
+
+    const invalid = assets.filter(
+      (a) => !LinkConstraints.ASSET.WHITELIST.includes(a as AssetCode),
+    );
+    if (invalid.length > 0) {
+      throw new LinkValidationError(
+        LinkErrorCode.ASSET_NOT_WHITELISTED,
+        `Unsupported asset(s) in acceptedAssets: ${invalid.join(', ')}`,
+        'acceptedAssets',
+      );
+    }
+
+    // Ensure the destination asset is always included
+    const unique = Array.from(new Set([...assets, destinationAsset]));
+    return unique;
+  }
+
+  private async buildSwapOptions(
+    destinationAmount: string,
+    destinationAsset: string,
+    acceptedAssets: string[],
+  ): Promise<PathPreviewRow[]> {
+    if (!this.pathPreviewService) {
+      return [];
+    }
+
+    const swapSourceAssets = acceptedAssets
+      .filter((a) => a !== destinationAsset)
+      .map((code) => ({ code }));
+
+    if (swapSourceAssets.length === 0) {
+      return [];
+    }
+
+    try {
+      const result = await this.pathPreviewService.previewPaths({
+        destinationAmount,
+        destinationAsset: { code: destinationAsset },
+        sourceAssets: swapSourceAssets,
+      });
+      return result.paths;
+    } catch (err) {
+      this.logger.warn(
+        'Swap path preview failed; returning empty swap options',
+        err,
+      );
+      return [];
+    }
+  }
+
   private generateCanonicalFormat(
     amount: string,
     asset: string,
@@ -275,6 +377,7 @@ export class LinksService {
     username?: string | null,
     destination?: string | null,
     referenceId?: string | null,
+    acceptedAssets?: string[] | null,
   ): string {
     const params = new URLSearchParams();
     params.set('amount', amount);
@@ -284,6 +387,9 @@ export class LinksService {
     if (username) params.set('username', username);
     if (destination) params.set('destination', destination);
     if (referenceId) params.set('ref', referenceId);
+    if (acceptedAssets && acceptedAssets.length > 0) {
+      params.set('acceptedAssets', acceptedAssets.join(','));
+    }
 
     return params.toString();
   }

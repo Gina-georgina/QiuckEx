@@ -1,9 +1,131 @@
-use soroban_sdk::{testutils::Address as _, Address, Bytes, Env};
+use soroban_sdk::{testutils::Ledger, Address, Bytes, BytesN, Env, Vec};
 
 use crate::{
-    storage::*,
+    storage::{
+        get_escrow, get_escrow_counter, has_escrow, increment_escrow_counter,
+        is_initialized, put_escrow, set_contract_version, set_initialized, CURRENT_CONTRACT_VERSION,
+    },
     types::{EscrowEntry, EscrowStatus},
 };
+
+#[test]
+fn test_ttl_auto_extend_on_activity() {
+    // No need to import Ledger trait; only use set_timestamp
+    let env = Env::default();
+    let contract_id = env.register(crate::QuickexContract, ());
+    env.as_contract(&contract_id, || {
+        let commitment: Bytes = Bytes::from_array(&env, &[3u8; 32]);
+        let token = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let amount = 1000i128;
+        let created_at = env.ledger().timestamp();
+        let entry = EscrowEntry {
+            token: token.clone(),
+            amount_due: amount,
+            amount_paid: amount,
+            owner: owner.clone(),
+            status: EscrowStatus::Pending,
+            created_at,
+            expires_at: 0,
+            arbiter: None,
+            arbiters: Vec::new(&env),
+            arbiter_threshold: 0,
+        memo: None,
+            milestones: Vec::new(env),
+        };
+        put_escrow(&env, &commitment, &entry);
+
+        // Simulate ledger aging and access (activity)
+        for i in 1..5 {
+            env.ledger().set_timestamp(created_at + (i * 100_000));
+            // Accessing the record should auto-extend TTL
+            assert!(get_escrow(&env, &commitment).is_some());
+        }
+    });
+}
+
+#[test]
+fn test_ttl_expiry_of_inactive_record() {
+    use soroban_sdk::testutils::Ledger;
+    let env = Env::default();
+    let contract_id = env.register(crate::QuickexContract, ());
+    env.as_contract(&contract_id, || {
+        let commitment: Bytes = Bytes::from_array(&env, &[4u8; 32]);
+        let token = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let amount = 1000i128;
+        let created_at = env.ledger().timestamp();
+        let entry = EscrowEntry {
+            token: token.clone(),
+            amount_due: amount,
+            amount_paid: amount,
+            owner: owner.clone(),
+            status: EscrowStatus::Pending,
+            created_at,
+            expires_at: 0,
+            arbiter: None,
+            arbiters: Vec::new(&env),
+            arbiter_threshold: 0,
+        memo: None,
+            milestones: Vec::new(env),
+        };
+        put_escrow(&env, &commitment, &entry);
+
+        // Simulate ledger aging without activity (no access)
+        env.ledger().set_timestamp(created_at + 10_000_000);
+        // Record should still exist (Soroban test env does not auto-expire, but this is where expiry would be checked in real runtime)
+        assert!(get_escrow(&env, &commitment).is_some());
+        // In a real chain, a cleanup or expiry sweep would remove it if TTL expired
+    });
+}
+
+#[test]
+fn test_cleanup_does_not_remove_active_escrow() {
+    let env = Env::default();
+    let contract_id = env.register(crate::QuickexContract, ());
+    env.as_contract(&contract_id, || {
+        let commitment: Bytes = Bytes::from_array(&env, &[5u8; 32]);
+        let token = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let amount = 1000i128;
+        let created_at = env.ledger().timestamp();
+        let entry = EscrowEntry {
+            token: token.clone(),
+            amount_due: amount,
+            amount_paid: amount,
+            owner: owner.clone(),
+            status: EscrowStatus::Pending,
+            created_at,
+            expires_at: 0,
+            arbiter: None,
+            arbiters: Vec::new(&env),
+            arbiter_threshold: 0,
+        memo: None,
+            milestones: Vec::new(env),
+        };
+        put_escrow(&env, &commitment, &entry);
+        // Attempt cleanup (should not remove active escrow)
+        let result = crate::escrow::cleanup_escrow(&env, commitment.clone().try_into().unwrap());
+        assert!(result.is_err());
+        assert!(has_escrow(&env, &commitment));
+    });
+}
+
+#[test]
+fn test_cleanup_escrow_batch_rejects_unbounded_input() {
+    let env = Env::default();
+    let contract_id = env.register(crate::QuickexContract, ());
+    env.as_contract(&contract_id, || {
+        let mut commitments = Vec::new(&env);
+        for i in 0..21u8 {
+            let commitment: BytesN<32> = BytesN::from_array(&env, &[i; 32]);
+            commitments.push_back(commitment);
+        }
+
+        let result = crate::escrow::cleanup_escrow_batch(&env, commitments);
+        assert_eq!(result, Err(crate::errors::QuickexError::InvalidAmount));
+    });
+}
 
 #[test]
 fn test_escrow_storage() {
@@ -19,11 +141,17 @@ fn test_escrow_storage() {
 
         let entry = EscrowEntry {
             token: token.clone(),
-            amount,
+            amount_due: amount,
+            amount_paid: amount,
             owner: owner.clone(),
             status: EscrowStatus::Pending,
             created_at,
             expires_at: 0,
+            arbiter: None,
+            arbiters: Vec::new(&env),
+            arbiter_threshold: 0,
+        memo: None,
+            milestones: Vec::new(env),
         };
 
         // Test put_escrow
@@ -35,7 +163,8 @@ fn test_escrow_storage() {
         // Test get_escrow
         let retrieved_entry = get_escrow(&env, &commitment).unwrap();
         assert_eq!(retrieved_entry.token, token);
-        assert_eq!(retrieved_entry.amount, amount);
+        assert_eq!(retrieved_entry.amount_due, amount);
+        assert_eq!(retrieved_entry.amount_paid, amount);
         assert_eq!(retrieved_entry.owner, owner);
         assert_eq!(retrieved_entry.status, EscrowStatus::Pending);
         assert_eq!(retrieved_entry.created_at, created_at);
@@ -60,11 +189,17 @@ fn test_escrow_status_update() {
 
         let mut entry = EscrowEntry {
             token: token.clone(),
-            amount,
+            amount_due: amount,
+            amount_paid: amount,
             owner: owner.clone(),
             status: EscrowStatus::Pending,
             created_at,
             expires_at: 0,
+            arbiter: None,
+            arbiters: Vec::new(&env),
+            arbiter_threshold: 0,
+        memo: None,
+            milestones: Vec::new(env),
         };
 
         put_escrow(&env, &commitment, &entry);
@@ -106,6 +241,33 @@ fn test_escrow_counter() {
 }
 
 #[test]
+fn test_contract_version_storage() {
+    let env = Env::default();
+    let contract_id = env.register(crate::QuickexContract, ());
+    env.as_contract(&contract_id, || {
+        assert_eq!(get_contract_version(&env), None);
+
+        set_contract_version(&env, CURRENT_CONTRACT_VERSION);
+        assert_eq!(get_contract_version(&env), Some(CURRENT_CONTRACT_VERSION));
+    });
+}
+
+#[test]
+fn test_initialized_flag_storage() {
+    let env = Env::default();
+    let contract_id = env.register(crate::QuickexContract, ());
+    env.as_contract(&contract_id, || {
+        assert!(!is_initialized(&env));
+
+        set_initialized(&env, true);
+        assert!(is_initialized(&env));
+
+        set_initialized(&env, false);
+        assert!(!is_initialized(&env));
+    });
+}
+
+#[test]
 fn test_admin_storage() {
     let env = Env::default();
     let contract_id = env.register(crate::QuickexContract, ());
@@ -132,12 +294,14 @@ fn test_paused_storage() {
         assert!(!is_paused(&env));
 
         // Test setting paused to true
-        set_paused(&env, true);
+        set_paused(&env, true, 1);
         assert!(is_paused(&env));
+        assert_eq!(get_global_pause_reason(&env), 1);
 
         // Test setting paused to false
-        set_paused(&env, false);
+        set_paused(&env, false, 0);
         assert!(!is_paused(&env));
+        assert_eq!(get_global_pause_reason(&env), 0);
     });
 }
 

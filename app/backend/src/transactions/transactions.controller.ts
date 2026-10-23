@@ -4,13 +4,17 @@ import {
   Get,
   HttpCode,
   HttpStatus,
+  Logger,
   Post,
   Query,
+  Req,
+  Res,
   UseGuards,
   UsePipes,
   ValidationPipe,
 } from "@nestjs/common";
 import { ApiOperation, ApiResponse, ApiTags, ApiHeader } from "@nestjs/swagger";
+import type { Request, Response } from "express";
 
 import {
   GetTransactionsQueryDto,
@@ -19,9 +23,19 @@ import {
 import { HorizonService } from "./horizon.service";
 
 import { ApiKeyGuard } from "../auth/guards/api-key.guard";
-import { CustomThrottlerGuard } from "../auth/guards/custom-throttler.guard";
-import { ComposeTransactionDto } from "./dto/compose-transaction.dto";
+import { TESTNET_CONTRACT_WRITES_FLAG } from "../feature-flags/contract-write-kill-switch.constants";
+import { NetworkSafetyGuard } from "../feature-flags/network-safety.guard";
+import { RequiresFlag } from "../feature-flags/requires-flag.decorator";
+import { ComposeTransactionDto, SimulateOperationDto, SubmitSignedTransactionDto } from "./dto/compose-transaction.dto";
 import { TransactionsService } from "./transaction.service";
+import { ContractMethodAllowlistGuard } from "../contracts/contract-method-allowlist.guard";
+import { SentryTracingService } from "../sentry/sentry-tracing.service";
+
+function correlationIdOf(req: Request): string | undefined {
+  return (req as unknown as Record<string, unknown>)["correlationId"] as
+    | string
+    | undefined;
+}
 
 @ApiTags("transactions")
 @ApiHeader({
@@ -29,13 +43,63 @@ import { TransactionsService } from "./transaction.service";
   description: "Optional API key for higher rate limits",
   required: false,
 })
-@UseGuards(ApiKeyGuard, CustomThrottlerGuard)
+@UseGuards(ApiKeyGuard)
 @Controller("transactions")
 export class TransactionsController {
+  private readonly logger = new Logger(TransactionsController.name);
+
   constructor(
     private readonly horizonService: HorizonService,
     private readonly transactionService: TransactionsService,
+    private readonly tracing: SentryTracingService,
   ) {}
+
+  private hasApiKey(req: Request): boolean {
+    const value = req.headers["x-api-key"];
+    return typeof value === "string" && value.length > 0;
+  }
+
+  /**
+   * ETag-based caching for the expensive compose/simulate operations.
+   * The cache key is the SHA-256 of the serialized request body. When the
+   * client sends an If-None-Match header matching the computed ETag we return
+   * 304 Not Modified. Requests carrying an X-API-Key header bypass the cache.
+   */
+  private async respondWithEtagCache(
+    route: EtagCacheRoute,
+    payload: unknown,
+    req: Request,
+    res: Response,
+    compute: () => Promise<object>,
+  ): Promise<unknown> {
+    if (this.hasApiKey(req)) {
+      const result = await compute();
+      return { ...result, correlationId: correlationIdOf(req) };
+    }
+
+    const etag = this.etagCache.computeCacheKey(payload);
+    res.setHeader("ETag", `"${etag}"`);
+    res.setHeader("Cache-Control", "no-cache");
+
+    const clientEtag = req.headers["if-none-match"];
+    const cached = this.etagCache.get(route, etag);
+
+    if (clientEtag && (clientEtag === `"${etag}"` || clientEtag === "*")) {
+      if (cached !== undefined) {
+        res.status(HttpStatus.NOT_MODIFIED);
+        return;
+      }
+      this.logger.warn(`Conditional ETag miss [${route}]: ${etag}`);
+    }
+
+    if (cached !== undefined) {
+      return { ...(cached as object), correlationId: correlationIdOf(req) };
+    }
+
+    const result = await compute();
+    this.etagCache.set(route, etag, result);
+    return { ...result, correlationId: correlationIdOf(req) };
+  }
 
   @Get()
   @ApiOperation({
@@ -77,8 +141,65 @@ export class TransactionsController {
   }
   @Post("compose")
   @HttpCode(HttpStatus.OK)
+  @UseGuards(NetworkSafetyGuard, ContractMethodAllowlistGuard)
+  @RequiresFlag(TESTNET_CONTRACT_WRITES_FLAG)
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
-  async compose(@Body() dto: ComposeTransactionDto) {
-    return this.transactionService.composeTransaction(dto);
+  async compose(@Body() dto: ComposeTransactionDto, @Req() req: Request) {
+    const result = await this.tracing.traceCompose(
+      `compose:${dto.contractId}::${dto.method}`,
+      () => this.transactionService.composeTransaction(dto),
+    );
+    return { ...result, correlationId: correlationIdOf(req) };
+  }
+
+  @Post("build")
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(NetworkSafetyGuard, ContractMethodAllowlistGuard)
+  @RequiresFlag(TESTNET_CONTRACT_WRITES_FLAG)
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  @ApiOperation({
+    summary: "Build unsigned Soroban transaction XDR with canonical memo/params",
+  })
+  async buildUnsignedXdr(@Body() dto: ComposeTransactionDto, @Req() req: Request) {
+    const result = await this.tracing.traceCompose(
+      `build:${dto.contractId}::${dto.method}`,
+      () => this.transactionService.composeTransaction(dto),
+    );
+    return { ...result, correlationId: correlationIdOf(req) };
+  }
+
+  @Post("simulate")
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(NetworkSafetyGuard, ContractMethodAllowlistGuard)
+  @RequiresFlag(TESTNET_CONTRACT_WRITES_FLAG)
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  @ApiOperation({
+    summary: "Simulate contract operations with deterministic failure reasons",
+  })
+  async simulateOperation(@Body() dto: SimulateOperationDto, @Req() req: Request) {
+    const result = await this.tracing.traceSimulate(
+      `simulate:${dto.contractId}::${dto.method}`,
+      () => this.transactionService.simulateOperation(dto),
+    );
+    return { ...result, correlationId: correlationIdOf(req) };
+  }
+
+  @Post("submit")
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(NetworkSafetyGuard)
+  @RequiresFlag(TESTNET_CONTRACT_WRITES_FLAG)
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  @ApiOperation({
+    summary: "Submit an already-signed transaction with idempotency support",
+  })
+  async submitSignedTransaction(
+    @Body() dto: SubmitSignedTransactionDto,
+    @Req() req: Request,
+  ) {
+    const result = await this.tracing.traceSubmit(
+      'submit',
+      () => this.transactionService.submitSignedTransaction(dto),
+    );
+    return { ...result, correlationId: correlationIdOf(req) };
   }
 }

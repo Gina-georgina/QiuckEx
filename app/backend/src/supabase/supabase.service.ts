@@ -3,6 +3,10 @@ import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
 import { AppConfigService } from "../config";
 import {
+  CORRELATION_ID_HEADER,
+  getCurrentCorrelationId,
+} from "../common/context/correlation.context";
+import {
   EscrowDbStatus,
   EscrowRecord,
   PaymentDbStatus,
@@ -13,6 +17,82 @@ import {
   SupabaseNetworkError,
   SupabaseUniqueConstraintError,
 } from "./supabase.errors";
+
+export interface SearchProfileResult {
+  id: string;
+  username: string;
+  public_key: string;
+  created_at: string;
+  last_active_at: string | null;
+  is_public: boolean;
+  similarity_score?: number;
+}
+
+export interface EditableProfileRecord {
+  username: string;
+  public_key: string;
+  profile_primary_color: string;
+  avatar_url: string | null;
+  bio: string;
+  twitter_handle: string;
+  discord_handle: string;
+  github_handle: string;
+  profile_version: number;
+}
+
+export interface TrendingCreatorResult extends SearchProfileResult {
+  transaction_volume: number;
+  transaction_count: number;
+}
+
+export interface FeaturedProfileResult extends SearchProfileResult {
+  featured_rank: number | null;
+}
+
+export interface MarketplaceListing {
+  id: string;
+  username: string;
+  seller_public_key: string;
+  asking_price: number;
+  status: "active" | "sold" | "cancelled";
+  created_at: string;
+  updated_at: string;
+  sold_at: string | null;
+  buyer_public_key: string | null;
+  final_price: number | null;
+}
+
+export interface MarketplaceBid {
+  id: string;
+  listing_id: string;
+  bidder_public_key: string;
+  bid_amount: number;
+  status: "pending" | "accepted" | "rejected" | "cancelled";
+  created_at: string;
+  updated_at: string;
+}
+
+export interface VerifiedAssetDbRecord {
+  id: string;
+  code: string;
+  issuer: string | null;
+  type: "native" | "credit_alphanum4" | "credit_alphanum12";
+  decimals: number;
+  icon_url: string | null;
+  verified: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Deterministic ascending tiebreaker used when the primary ranking metric
+ * (volume, activity timestamp, featured rank) is equal between two rows.
+ */
+function compareIdsAsc(a: { id: string }, b: { id: string }): number {
+  if (a.id < b.id) return -1;
+  if (a.id > b.id) return 1;
+  return 0;
+}
 
 @Injectable()
 export class SupabaseService {
@@ -29,9 +109,33 @@ export class SupabaseService {
       auth: {
         persistSession: false,
       },
+      global: {
+        fetch: this.correlatingFetch.bind(this),
+      },
     });
 
     this.logger.log("Supabase client initialized successfully");
+  }
+
+  /**
+   * Wrap the global fetch used by the Supabase client so every outbound request
+   * to Supabase carries the current request correlation ID header. Falls back
+   * to the native fetch when the correlation ID is unavailable.
+   */
+  private correlatingFetch(
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ): Promise<Response> {
+    const correlationId = getCurrentCorrelationId();
+    if (!correlationId) return fetch(input, init);
+
+    const headers = new Headers(init?.headers);
+    headers.set(CORRELATION_ID_HEADER, correlationId);
+
+    return fetch(input, {
+      ...init,
+      headers,
+    });
   }
 
   /**
@@ -95,9 +199,70 @@ export class SupabaseService {
     return data ?? [];
   }
 
+  async getProfileSettings(publicKey: string): Promise<EditableProfileRecord[]> {
+    const { data, error } = await this.client
+      .from("usernames")
+      .select("username, public_key, profile_primary_color, avatar_url, bio, twitter_handle, discord_handle, github_handle, profile_version")
+      .eq("public_key", publicKey)
+      .order("created_at", { ascending: true });
+    if (error) this.handleError(error);
+    return (data ?? []) as EditableProfileRecord[];
+  }
+
+  async updateProfileSettings(
+    publicKey: string,
+    username: string,
+    expectedVersion: number,
+    profile: Omit<EditableProfileRecord, "username" | "public_key" | "profile_version">,
+  ): Promise<{ status: "updated"; profile: EditableProfileRecord } | { status: "conflict" | "not_found" }> {
+    const { data, error } = await this.client
+      .from("usernames")
+      .update({ ...profile, profile_version: expectedVersion + 1 })
+      .eq("username", username)
+      .eq("public_key", publicKey)
+      .eq("profile_version", expectedVersion)
+      .select("username, public_key, profile_primary_color, avatar_url, bio, twitter_handle, discord_handle, github_handle, profile_version")
+      .maybeSingle();
+
+    if (error) this.handleError(error);
+    if (data) {
+      return { status: "updated", profile: data as EditableProfileRecord };
+    }
+
+    const { data: current, error: lookupError } = await this.client
+      .from("usernames")
+      .select("username")
+      .eq("username", username)
+      .eq("public_key", publicKey)
+      .maybeSingle();
+    if (lookupError) this.handleError(lookupError);
+    return current ? { status: "conflict" } : { status: "not_found" };
+  }
+
+  async getUsername(username: string): Promise<SearchProfileResult | null> {
+    const { data, error } = await this.client
+      .from("usernames")
+      .select("id, username, public_key, created_at, last_active_at, is_public")
+      .eq("username", username.toLowerCase())
+      .maybeSingle();
+
+    if (error) this.handleError(error);
+    return data as SearchProfileResult | null;
+  }
+
+
   // ---------------------------------------------------------------------------
   // Reconciliation helpers
   // ---------------------------------------------------------------------------
+
+  async fetchAllEscrows(): Promise<EscrowRecord[]> {
+    const { data, error } = await this.client
+      .from("escrow_records")
+      .select("*")
+      .order("updated_at", { ascending: true });
+    if (error) this.handleError(error);
+    return (data as EscrowRecord[]) ?? [];
+  }
 
   async fetchPendingEscrows(
     statuses: EscrowDbStatus[],
@@ -113,6 +278,15 @@ export class SupabaseService {
     return (data as EscrowRecord[]) ?? [];
   }
 
+  async fetchAllPayments(): Promise<PaymentRecord[]> {
+    const { data, error } = await this.client
+      .from("payment_records")
+      .select("*")
+      .order("updated_at", { ascending: true });
+    if (error) this.handleError(error);
+    return (data as PaymentRecord[]) ?? [];
+  }
+
   async fetchPendingPayments(
     statuses: PaymentDbStatus[],
     limit: number,
@@ -123,6 +297,16 @@ export class SupabaseService {
       .in("status", statuses)
       .order("updated_at", { ascending: true })
       .limit(limit);
+    if (error) this.handleError(error);
+    return (data as PaymentRecord[]) ?? [];
+  }
+
+  async fetchPaidPayments(): Promise<PaymentRecord[]> {
+    const { data, error } = await this.client
+      .from("payment_records")
+      .select("*")
+      .eq("status", PaymentDbStatus.Paid)
+      .order("created_at", { ascending: false });
     if (error) this.handleError(error);
     return (data as PaymentRecord[]) ?? [];
   }
@@ -187,5 +371,864 @@ export class SupabaseService {
       );
       return false;
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Public profile discovery helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Search for public usernames with fuzzy matching using PostgreSQL trigram similarity
+   */
+  async searchPublicUsernames(
+    query: string,
+    limit: number = 10,
+  ): Promise<SearchProfileResult[]> {
+    const normalizedQuery = query.trim().toLowerCase();
+
+    // Use PostgreSQL word_similarity for fuzzy matching
+    // This requires the pg_trgm extension to be enabled
+    const { data, error } = await this.client.rpc("search_usernames", {
+      search_query: normalizedQuery,
+      result_limit: limit,
+    });
+
+    if (error) {
+      this.logger.warn(
+        `PostgreSQL function search_usernames not available, using fallback: ${error.message}`,
+      );
+      // Fallback: simple LIKE query with wildcards
+      return this.searchUsernamesFallback(normalizedQuery, limit);
+    }
+
+    // Normalize the RPC result: PostgREST may return `similarity_score` as a
+    // string (e.g. numeric columns), so coerce it to a number and guarantee a
+    // stable value for every row.
+    return (data ?? []).map((row: SearchProfileResult) => ({
+      ...row,
+      similarity_score:
+        row.similarity_score == null
+          ? this.calculateSimpleSimilarity(row.username, normalizedQuery)
+          : Number(row.similarity_score),
+    }));
+  }
+
+  /**
+   * Fallback search when pg_trgm is not available
+   */
+  private async searchUsernamesFallback(
+    query: string,
+    limit: number,
+  ): Promise<SearchProfileResult[]> {
+    // Escape special characters for LIKE query
+    const escapedQuery = query.replace(/[%_]/g, "\\$&");
+    const pattern = `%${escapedQuery}%`;
+
+    const { data, error } = await this.client
+      .from("usernames")
+      .select("id, username, public_key, created_at, last_active_at, is_public")
+      .eq("is_public", true)
+      .ilike("username", pattern)
+      .order("last_active_at", { ascending: false })
+      .limit(limit);
+
+    if (error) this.handleError(error);
+
+    // Calculate simple similarity score based on position and length
+    return (data ?? [])
+      .map((row: SearchProfileResult) => ({
+        ...row,
+        similarity_score: this.calculateSimpleSimilarity(row.username, query),
+      }))
+      .sort(
+        (a: SearchProfileResult, b: SearchProfileResult) =>
+          (b.similarity_score ?? 0) - (a.similarity_score ?? 0),
+      );
+  }
+
+  /**
+   * Calculate simple similarity score (0-100) for fallback search
+   */
+  private calculateSimpleSimilarity(username: string, query: string): number {
+    const lowerUsername = username.toLowerCase();
+    const lowerQuery = query.toLowerCase();
+
+    // Exact match
+    if (lowerUsername === lowerQuery) return 100;
+
+    // Starts with query
+    if (lowerUsername.startsWith(lowerQuery)) return 90;
+
+    // Contains query
+    if (lowerUsername.includes(lowerQuery)) return 75;
+
+    // Partial match with some character overlap
+    const commonChars = lowerUsername
+      .split("")
+      .filter((c) => lowerQuery.includes(c)).length;
+    const maxLen = Math.max(lowerUsername.length, lowerQuery.length);
+    return Math.round((commonChars / maxLen) * 100);
+  }
+
+  /**
+   * Get trending creators based on transaction volume in a time window
+   */
+  async getTrendingCreators(
+    timeWindowHours: number,
+    limit: number = 10,
+  ): Promise<TrendingCreatorResult[]> {
+    const cutoffTime = new Date();
+    cutoffTime.setHours(cutoffTime.getHours() - timeWindowHours);
+
+    // Query payment_records and escrow_records for volume calculation
+    const { data: payments, error: paymentsError } = await this.client
+      .from("payment_records")
+      .select("sender_public_key, receiver_public_key, amount_usd, created_at")
+      .gte("created_at", cutoffTime.toISOString())
+      .in("status", ["completed", "pending"]);
+
+    if (paymentsError) {
+      this.logger.warn(
+        `Failed to fetch payment records: ${paymentsError.message}`,
+      );
+    }
+
+    // Aggregate volumes by public key
+    const volumeMap = new Map<string, { volume: number; count: number }>();
+
+    const processTransaction = (publicKey: string, amountUsd: number) => {
+      if (!publicKey || amountUsd == null) return;
+
+      const current = volumeMap.get(publicKey) || { volume: 0, count: 0 };
+      current.volume += Number(amountUsd) || 0;
+      current.count += 1;
+      volumeMap.set(publicKey, current);
+    };
+
+    (payments ?? []).forEach(
+      (payment: {
+        sender_public_key: string;
+        receiver_public_key: string;
+        amount_usd: number;
+      }) => {
+        processTransaction(payment.sender_public_key, payment.amount_usd);
+        processTransaction(payment.receiver_public_key, payment.amount_usd);
+      },
+    );
+
+    // Rank all candidates by volume first. Slicing to `limit` must happen
+    // *after* filtering to public profiles below, otherwise a candidate that
+    // ranks in the true top-N of public profiles could be dropped here just
+    // because non-public accounts occupied the top volume slots.
+    const rankedCandidates = Array.from(volumeMap.entries()).sort(
+      (a, b) => b[1].volume - a[1].volume,
+    );
+
+    if (rankedCandidates.length === 0) {
+      return [];
+    }
+
+    const publicKeys = rankedCandidates.map(([key]) => key);
+    const { data: profiles, error: profilesError } = await this.client
+      .from("usernames")
+      .select("id, username, public_key, created_at, last_active_at, is_public")
+      .in("public_key", publicKeys)
+      .eq("is_public", true);
+
+    if (profilesError) {
+      this.logger.warn(`Failed to fetch profiles: ${profilesError.message}`);
+      return [];
+    }
+
+    const profileByKey = new Map(
+      (profiles ?? []).map((profile: SearchProfileResult) => [
+        profile.public_key,
+        profile,
+      ]),
+    );
+
+    // Merge volume data with profile data. Ties in volume are broken by `id`
+    // so the ranking is deterministic and stable across identical requests.
+    return rankedCandidates
+      .filter(([key]) => profileByKey.has(key))
+      .map(([key, stats]) => {
+        const profile = profileByKey.get(key) as SearchProfileResult;
+        return {
+          ...profile,
+          transaction_volume: stats.volume,
+          transaction_count: stats.count,
+        } as TrendingCreatorResult;
+      })
+      .sort((a: TrendingCreatorResult, b: TrendingCreatorResult) => {
+        const diff = (b.transaction_volume || 0) - (a.transaction_volume || 0);
+        return diff !== 0 ? diff : compareIdsAsc(a, b);
+      })
+      .slice(0, limit);
+  }
+
+  /**
+   * Update last_active_at timestamp for a username
+   */
+  async updateUsernameActivity(username: string): Promise<void> {
+    const { error } = await this.client
+      .from("usernames")
+      .update({ last_active_at: new Date().toISOString() })
+      .eq("username", username);
+
+    if (error) this.handleError(error);
+  }
+
+  /**
+   * Get recently active users based on payment activity and profile updates
+   */
+  async getRecentlyActiveUsers(
+    timeWindowHours: number,
+    limit: number = 10,
+  ): Promise<SearchProfileResult[]> {
+    const cutoffTime = new Date();
+    cutoffTime.setHours(cutoffTime.getHours() - timeWindowHours);
+
+    // Query payment_records for recent activity
+    const { data: payments, error: paymentsError } = await this.client
+      .from("payment_records")
+      .select("sender_public_key, receiver_public_key, created_at")
+      .gte("created_at", cutoffTime.toISOString())
+      .in("status", ["completed", "pending"]);
+
+    if (paymentsError) {
+      this.logger.warn(
+        `Failed to fetch payment records for recently active: ${paymentsError.message}`,
+      );
+    }
+
+    // Collect all active public keys from payments
+    const activePublicKeys = new Set<string>();
+    (payments ?? []).forEach(
+      (payment: { sender_public_key: string; receiver_public_key: string }) => {
+        if (payment.sender_public_key)
+          activePublicKeys.add(payment.sender_public_key);
+        if (payment.receiver_public_key)
+          activePublicKeys.add(payment.receiver_public_key);
+      },
+    );
+
+    // Also include users with recent profile activity
+    const { data: profileActivity, error: profileError } = await this.client
+      .from("usernames")
+      .select("public_key")
+      .gte("last_active_at", cutoffTime.toISOString())
+      .eq("is_public", true);
+
+    if (profileError) {
+      this.logger.warn(
+        `Failed to fetch profile activity: ${profileError.message}`,
+      );
+    }
+
+    (profileActivity ?? []).forEach((profile: { public_key: string }) => {
+      activePublicKeys.add(profile.public_key);
+    });
+
+    if (activePublicKeys.size === 0) {
+      return [];
+    }
+
+    // Fetch public profiles for these active users. We intentionally do not
+    // limit or order at the DB level here: `last_active_at` on this table can
+    // be stale compared to the payment-derived activity merged in below, so
+    // limiting before that merge could drop candidates that actually rank in
+    // the true top-N. Ranking and limiting happen after the merge instead.
+    const { data: profiles, error: profilesError } = await this.client
+      .from("usernames")
+      .select("id, username, public_key, created_at, last_active_at, is_public")
+      .in("public_key", Array.from(activePublicKeys))
+      .eq("is_public", true);
+
+    if (profilesError) {
+      this.logger.warn(`Failed to fetch profiles: ${profilesError.message}`);
+      return [];
+    }
+
+    // Get the most recent activity timestamp for each user
+    const activityMap = new Map<string, string>();
+
+    // Process payment activity
+    (payments ?? []).forEach(
+      (payment: {
+        sender_public_key: string;
+        receiver_public_key: string;
+        created_at: string;
+      }) => {
+        const timestamp = payment.created_at;
+        if (payment.sender_public_key) {
+          const current = activityMap.get(payment.sender_public_key);
+          if (!current || timestamp > current) {
+            activityMap.set(payment.sender_public_key, timestamp);
+          }
+        }
+        if (payment.receiver_public_key) {
+          const current = activityMap.get(payment.receiver_public_key);
+          if (!current || timestamp > current) {
+            activityMap.set(payment.receiver_public_key, timestamp);
+          }
+        }
+      },
+    );
+
+    // Merge with profile data and sort by activity. Ties are broken by `id`
+    // so the ranking is deterministic and stable across identical requests.
+    return (profiles ?? [])
+      .map((profile: SearchProfileResult) => ({
+        ...profile,
+        last_active_at:
+          activityMap.get(profile.public_key) || profile.last_active_at,
+      }))
+      .sort((a: SearchProfileResult, b: SearchProfileResult) => {
+        const aTime = new Date(a.last_active_at || a.created_at).getTime();
+        const bTime = new Date(b.last_active_at || b.created_at).getTime();
+        return bTime !== aTime ? bTime - aTime : compareIdsAsc(a, b);
+      })
+      .slice(0, limit);
+  }
+
+  /**
+   * Get curated/featured usernames for discovery, ordered by manual
+   * `featured_rank` (ascending, nulls last) with `id` as a deterministic
+   * tiebreaker.
+   */
+  async getFeaturedUsernames(
+    limit: number = 10,
+  ): Promise<FeaturedProfileResult[]> {
+    const { data, error } = await this.client
+      .from("usernames")
+      .select(
+        "id, username, public_key, created_at, last_active_at, is_public, featured_rank",
+      )
+      .eq("is_public", true)
+      .eq("is_featured", true)
+      .order("featured_rank", { ascending: true, nullsFirst: false })
+      .order("id", { ascending: true })
+      .limit(limit);
+
+    if (error) this.handleError(error);
+
+    // Guard: only return rows explicitly marked as featured and normalize
+    // `featured_rank` to `number | null` (PostgREST may return it as a string).
+    return (data ?? [])
+      .filter(
+        (row: FeaturedProfileResult & { is_featured?: boolean }) =>
+          row.is_featured === true,
+      )
+      .map((row: FeaturedProfileResult) => ({
+        ...row,
+        featured_rank:
+          row.featured_rank == null ? null : Number(row.featured_rank),
+      }));
+  }
+
+  /**
+   * Fetch a single public profile by username
+   */
+  async getPublicProfile(
+    username: string,
+  ): Promise<SearchProfileResult | null> {
+    const { data, error } = await this.client
+      .from("usernames")
+      .select(
+        "id, username, public_key, created_at, last_active_at, is_public",
+      )
+      .eq("username", username)
+      .eq("is_public", true)
+      .single();
+
+    if (error) {
+      if (error.code === "PGRST116") return null; // not found
+      this.handleError(error);
+    }
+
+    return (data as SearchProfileResult) ?? null;
+  }
+
+  /**
+   * Toggle public profile visibility
+   */
+  async togglePublicProfile(
+    username: string,
+    isPublic: boolean,
+  ): Promise<void> {
+    const { error } = await this.client
+      .from("usernames")
+      .update({
+        is_public: isPublic,
+        last_active_at: new Date().toISOString(),
+      })
+      .eq("username", username);
+
+    if (error) this.handleError(error);
+  }
+
+  async createListing(
+    username: string,
+    sellerPublicKey: string,
+    askingPrice: number,
+  ): Promise<MarketplaceListing> {
+    const { data, error } = await this.client
+      .from("username_marketplace")
+      .insert({
+        username,
+        seller_public_key: sellerPublicKey,
+        asking_price: askingPrice,
+      })
+      .select()
+      .single();
+    if (error) this.handleError(error);
+    return data as MarketplaceListing;
+  }
+
+  async countActiveListingsBySeller(sellerPublicKey: string): Promise<number> {
+    const { count, error } = await this.client
+      .from("username_marketplace")
+      .select("id", { count: "exact", head: true })
+      .eq("seller_public_key", sellerPublicKey)
+      .eq("status", "active");
+    if (error) this.handleError(error);
+    return count ?? 0;
+  }
+
+  async countPendingBidsByBidder(
+    listingId: string,
+    bidderPublicKey: string,
+  ): Promise<number> {
+    const { count, error } = await this.client
+      .from("username_bids")
+      .select("id", { count: "exact", head: true })
+      .eq("listing_id", listingId)
+      .eq("bidder_public_key", bidderPublicKey)
+      .eq("status", "pending");
+    if (error) this.handleError(error);
+    return count ?? 0;
+  }
+
+  async searchActiveListings(
+    query: string,
+    limit: number = 10,
+  ): Promise<{ listings: MarketplaceListing[]; next_cursor: string | null; has_more: boolean; total: number }> {
+    const normalizedQuery = query.trim().toLowerCase();
+    const effectiveLimit = Math.min(100, Math.max(1, limit));
+
+    let dbQuery = this.client
+      .from("username_marketplace")
+      .select("*", { count: "exact" })
+      .eq("status", "active");
+
+    if (normalizedQuery) {
+      dbQuery = dbQuery.or(`username.ilike.%${normalizedQuery}%,seller_public_key.ilike.%${normalizedQuery}%`);
+    }
+
+    const { data, error, count } = await dbQuery
+      .order("created_at", { ascending: false })
+      .order("id", { ascending: false })
+      .limit(effectiveLimit + 1);
+
+    if (error) this.handleError(error);
+
+    const rows = (data ?? []) as MarketplaceListing[];
+    const hasMore = rows.length > effectiveLimit;
+    const listings = hasMore ? rows.slice(0, effectiveLimit) : rows;
+
+    return {
+      listings,
+      next_cursor: null,
+      has_more: hasMore,
+      total: count ?? rows.length,
+    };
+  }
+
+  async getActiveListings(
+    limit: number,
+    cursor: string | null,
+  ): Promise<{ listings: MarketplaceListing[]; next_cursor: string | null; has_more: boolean; total: number }> {
+    const effectiveLimit = Math.min(100, Math.max(1, limit));
+
+    let query = this.client
+      .from('username_marketplace')
+      .select('*', { count: 'exact' })
+      .eq('status', 'active');
+
+    if (cursor) {
+      // Decode cursor
+      try {
+        const json = Buffer.from(cursor, 'base64url').toString('utf-8');
+        const parsed = JSON.parse(json);
+        if (typeof parsed.pk === 'string' && typeof parsed.id === 'string') {
+          query = query
+            .lt('created_at', parsed.pk)
+            .or(`created_at.eq.${parsed.pk},id.lt.${parsed.id}`);
+        }
+      } catch {
+        // invalid cursor – start from beginning
+      }
+    }
+
+    query = query
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(effectiveLimit + 1);
+
+    const { data, error, count } = await query;
+    if (error) this.handleError(error);
+
+    const rows = (data ?? []) as MarketplaceListing[];
+    const hasMore = rows.length > effectiveLimit;
+    const listings = hasMore ? rows.slice(0, effectiveLimit) : rows;
+
+    let nextCursor: string | null = null;
+    if (hasMore && listings.length > 0) {
+      const last = listings[listings.length - 1];
+      nextCursor = Buffer.from(
+        JSON.stringify({ pk: last.created_at, id: last.id }),
+        'utf-8',
+      ).toString('base64url');
+    }
+
+    return {
+      listings,
+      next_cursor: nextCursor,
+      has_more: hasMore,
+      total: count ?? 0,
+    };
+  }
+
+  async getBidsByListingIdPaginated(
+    listingId: string,
+    limit: number,
+    cursor: string | null,
+  ): Promise<{ bids: MarketplaceBid[]; next_cursor: string | null; has_more: boolean }> {
+    const effectiveLimit = Math.min(100, Math.max(1, limit));
+
+    let query = this.client
+      .from('username_bids')
+      .select('*')
+      .eq('listing_id', listingId);
+
+    if (cursor) {
+      try {
+        const json = Buffer.from(cursor, 'base64url').toString('utf-8');
+        const parsed = JSON.parse(json);
+        if (typeof parsed.pk === 'string' && typeof parsed.id === 'string') {
+          query = query
+            .lt('created_at', parsed.pk)
+            .or(`created_at.eq.${parsed.pk},id.lt.${parsed.id}`);
+        }
+      } catch {
+        // invalid cursor
+      }
+    }
+
+    query = query
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(effectiveLimit + 1);
+
+    const { data, error } = await query;
+    if (error) this.handleError(error);
+
+    const rows = (data ?? []) as MarketplaceBid[];
+    const hasMore = rows.length > effectiveLimit;
+    const bids = hasMore ? rows.slice(0, effectiveLimit) : rows;
+
+    let nextCursor: string | null = null;
+    if (hasMore && bids.length > 0) {
+      const last = bids[bids.length - 1];
+      nextCursor = Buffer.from(
+        JSON.stringify({ pk: last.created_at, id: last.id }),
+        'utf-8',
+      ).toString('base64url');
+    }
+
+    return { bids, next_cursor: nextCursor, has_more: hasMore };
+  }
+
+  async getListingById(listingId: string): Promise<MarketplaceListing | null> {
+    const { data, error } = await this.client
+      .from("username_marketplace")
+      .select("*")
+      .eq("id", listingId)
+      .maybeSingle();
+    if (error) this.handleError(error);
+    return data as MarketplaceListing | null;
+  }
+
+  async getActiveListingByUsername(
+    username: string,
+  ): Promise<MarketplaceListing | null> {
+    const { data, error } = await this.client
+      .from("username_marketplace")
+      .select("*")
+      .eq("username", username)
+      .eq("status", "active")
+      .maybeSingle();
+    if (error) this.handleError(error);
+    return data as MarketplaceListing | null;
+  }
+
+  async cancelListing(listingId: string): Promise<void> {
+    const { error } = await this.client
+      .from("username_marketplace")
+      .update({ status: "cancelled", updated_at: new Date().toISOString() })
+      .eq("id", listingId);
+    if (error) this.handleError(error);
+  }
+
+  async placeBid(
+    listingId: string,
+    bidderPublicKey: string,
+    bidAmount: number,
+    signature: string,
+    signedAt: number,
+  ): Promise<MarketplaceBid> {
+    const { data, error } = await this.client
+      .from("username_bids")
+      .insert({
+        listing_id: listingId,
+        bidder_public_key: bidderPublicKey,
+        bid_amount: bidAmount,
+        signature,
+        signed_at: new Date(signedAt).toISOString(),
+      })
+      .select()
+      .single();
+    if (error) this.handleError(error);
+    return data as MarketplaceBid;
+  }
+
+  async getBidsByListingId(listingId: string): Promise<MarketplaceBid[]> {
+    const { data, error } = await this.client
+      .from("username_bids")
+      .select("*")
+      .eq("listing_id", listingId)
+      .order("bid_amount", { ascending: false });
+    if (error) this.handleError(error);
+    return (data ?? []) as MarketplaceBid[];
+  }
+
+  async getBidById(bidId: string): Promise<MarketplaceBid | null> {
+    const { data, error } = await this.client
+      .from("username_bids")
+      .select("*")
+      .eq("id", bidId)
+      .maybeSingle();
+    if (error) this.handleError(error);
+    return data as MarketplaceBid | null;
+  }
+
+  async acceptBid(
+    listingId: string,
+    bidId: string,
+    sellerPublicKey: string,
+  ): Promise<void> {
+    const { error } = await this.client.rpc("accept_username_bid", {
+      p_listing_id: listingId,
+      p_bid_id: bidId,
+      p_seller_public_key: sellerPublicKey,
+    });
+    if (error) this.handleError(error);
+  }
+
+  async fetchVerifiedAssets(): Promise<VerifiedAssetDbRecord[]> {
+    const { data, error } = await this.client
+      .from("verified_assets")
+      .select("*")
+      .order("code", { ascending: true });
+    if (error) this.handleError(error);
+    return (data ?? []) as VerifiedAssetDbRecord[];
+  }
+
+  async searchVerifiedAssets(query: string): Promise<VerifiedAssetDbRecord[]> {
+    const pattern = `%${query.trim().toLowerCase()}%`;
+    const { data, error } = await this.client
+      .from("verified_assets")
+      .select("*")
+      .or(`code.ilike.${pattern},issuer.ilike.${pattern}`)
+      .order("code", { ascending: true });
+    if (error) this.handleError(error);
+    return (data ?? []) as VerifiedAssetDbRecord[];
+  }
+
+  async upsertVerifiedAsset(asset: {
+    code: string;
+    issuer: string | null;
+    type: "native" | "credit_alphanum4" | "credit_alphanum12";
+    decimals: number;
+    icon_url: string | null;
+    verified: boolean;
+  }): Promise<VerifiedAssetDbRecord> {
+    let selectQuery = this.client
+      .from("verified_assets")
+      .select("*")
+      .eq("code", asset.code);
+
+    if (asset.issuer === null) {
+      selectQuery = selectQuery.is("issuer", null);
+    } else {
+      selectQuery = selectQuery.eq("issuer", asset.issuer);
+    }
+
+    const { data: existing, error: selectError } = await selectQuery.maybeSingle();
+    if (selectError) this.handleError(selectError);
+
+    if (existing) {
+      const { data, error } = await this.client
+        .from("verified_assets")
+        .update({
+          type: asset.type,
+          decimals: asset.decimals,
+          icon_url: asset.icon_url,
+          verified: asset.verified,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", existing.id)
+        .select()
+        .single();
+      if (error) this.handleError(error);
+      return data as VerifiedAssetDbRecord;
+    } else {
+      const { data, error } = await this.client
+        .from("verified_assets")
+        .insert({
+          code: asset.code,
+          issuer: asset.issuer,
+          type: asset.type,
+          decimals: asset.decimals,
+          icon_url: asset.icon_url,
+          verified: asset.verified,
+        })
+        .select()
+        .single();
+      if (error) this.handleError(error);
+      return data as VerifiedAssetDbRecord;
+    }
+  }
+
+  async updateAssetVerificationStatus(
+    code: string,
+    issuer: string | null,
+    verified: boolean,
+  ): Promise<VerifiedAssetDbRecord | null> {
+    let query = this.client
+      .from("verified_assets")
+      .update({
+        verified,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("code", code);
+
+    if (issuer === null) {
+      query = query.is("issuer", null);
+    } else {
+      query = query.eq("issuer", issuer);
+    }
+
+    const { data, error } = await query.select().maybeSingle();
+    if (error) this.handleError(error);
+    return data as VerifiedAssetDbRecord | null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Username on-chain claim reconciliation (issue #193)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Paginated list of `claimed` usernames for on-chain reconciliation.
+   * `cursor` is the ISO `created_at` timestamp of the last processed row.
+   */
+  async fetchClaimedUsernames(
+    limit: number,
+    cursor?: string,
+  ): Promise<Array<{ id: string; username: string; public_key: string; created_at: string; last_active_at: string | null }>> {
+    let query = this.client
+      .from("usernames")
+      .select("id, username, public_key, created_at, last_active_at")
+      .eq("ownership_status", "claimed")
+      .order("created_at", { ascending: true })
+      .limit(limit);
+    if (cursor) {
+      query = query.gt("created_at", cursor);
+    }
+    const { data, error } = await query;
+    if (error) this.handleError(error);
+    return (data ?? []) as Array<{ id: string; username: string; public_key: string; created_at: string; last_active_at: string | null }>;
+  }
+
+  /**
+   * Flag a username for on-chain reconciliation review (account not found on Horizon).
+   * Sets `ownership_status = 'flagged'` and records the flag timestamp.
+   */
+  async flagUsernameForReview(username: string, reason: string): Promise<void> {
+    const { error } = await this.client
+      .from("usernames")
+      .update({ ownership_status: "flagged", squatting_flagged_at: new Date().toISOString() })
+      .eq("username", username);
+    if (error) this.handleError(error);
+    this.logger.log(`Username '${username}' flagged for review: ${reason}`);
+  }
+
+  /**
+   * Restore a flagged username back to `claimed` status after admin review.
+   */
+  async unflagUsername(username: string): Promise<void> {
+    const { error } = await this.client
+      .from("usernames")
+      .update({ ownership_status: "claimed", squatting_flagged_at: null })
+      .eq("username", username);
+    if (error) this.handleError(error);
+  }
+
+  /**
+   * Return the lightweight ownership/activity state for a single username.
+   */
+  async getOwnershipStatus(
+    username: string,
+  ): Promise<{ ownership_status: string; last_active_at: string | null; public_key: string } | null> {
+    const { data, error } = await this.client
+      .from("usernames")
+      .select("ownership_status, last_active_at, public_key")
+      .eq("username", username)
+      .maybeSingle();
+    if (error) this.handleError(error);
+    return data as { ownership_status: string; last_active_at: string | null; public_key: string } | null;
+  }
+
+  /**
+   * Persist a username reconciliation run report for audit / diagnostics.
+   * Idempotent on `run_id`.
+   */
+  async persistUsernameReconciliationRun(report: {
+    runId: string;
+    startedAt: string;
+    completedAt: string;
+    durationMs: number;
+    processed: number;
+    confirmed: number;
+    flagged: number;
+    skipped: number;
+  }): Promise<void> {
+    const { error } = await this.client
+      .from("username_reconciliation_runs")
+      .upsert(
+        {
+          run_id: report.runId,
+          started_at: report.startedAt,
+          completed_at: report.completedAt,
+          duration_ms: report.durationMs,
+          processed: report.processed,
+          confirmed: report.confirmed,
+          flagged: report.flagged,
+          skipped: report.skipped,
+          report,
+        },
+        { onConflict: "run_id" },
+      );
+    if (error) this.handleError(error);
   }
 }

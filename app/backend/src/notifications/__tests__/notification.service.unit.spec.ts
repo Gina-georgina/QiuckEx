@@ -3,6 +3,8 @@ import { EventEmitterModule } from "@nestjs/event-emitter";
 import { NotificationService } from "../notification.service";
 import { NotificationPreferencesRepository } from "../notification-preferences.repository";
 import { NotificationLogRepository } from "../notification-log.repository";
+import { InAppNotificationRepository } from "../in-app-notification.repository";
+import { TemplateVersionService } from "../template-versioning/template-version.service";
 import { NOTIFICATION_PROVIDERS } from "../providers/notification-provider.interface";
 import type {
   NotificationPreference,
@@ -40,13 +42,14 @@ function makeEscrowDepositedEvent(
     ledgerSequence: 100,
     pagingToken: "100-1",
     contractTimestamp: 1700000000n,
+    schemaVersion: 2,
     commitment: "deadbeef".repeat(8),
     owner: PUBLIC_KEY,
     token: "CTOKEN",
     amount: 50_000_000n, // 5 XLM
     expiresAt: 1800000000n,
     ...overrides,
-  };
+  } as EscrowDepositedEvent;
 }
 
 function makePayload(
@@ -86,6 +89,25 @@ const mockLogRepo = (): jest.Mocked<NotificationLogRepository> =>
     getPendingRetries: jest.fn().mockResolvedValue([]),
   }) as unknown as jest.Mocked<NotificationLogRepository>;
 
+const mockInAppRepo = (): jest.Mocked<InAppNotificationRepository> =>
+  ({
+    create: jest.fn().mockResolvedValue({ id: "in-app-1" }),
+  }) as unknown as jest.Mocked<InAppNotificationRepository>;
+
+const mockTemplateService = (): jest.Mocked<TemplateVersionService> =>
+  ({
+    render: jest
+      .fn()
+      .mockReturnValue({ title: "Rendered", body: "Rendered Body" }),
+    renderActiveTemplateForEventType: jest
+      .fn()
+      .mockResolvedValue({
+        title: "Rendered",
+        body: "Rendered Body",
+        templateId: "tpl-1",
+      }),
+  }) as unknown as jest.Mocked<TemplateVersionService>;
+
 const mockEmailProvider = () => ({
   channel: "email",
   send: jest.fn().mockResolvedValue({ messageId: "msg-1" }),
@@ -97,12 +119,16 @@ describe("NotificationService", () => {
   let service: NotificationService;
   let prefsRepo: jest.Mocked<NotificationPreferencesRepository>;
   let logRepo: jest.Mocked<NotificationLogRepository>;
+  let inAppRepo: jest.Mocked<InAppNotificationRepository>;
+  let templateService: jest.Mocked<TemplateVersionService>;
   let emailProvider: ReturnType<typeof mockEmailProvider>;
   let module: TestingModule;
 
   beforeEach(async () => {
     prefsRepo = mockPrefsRepo();
     logRepo = mockLogRepo();
+    inAppRepo = mockInAppRepo();
+    templateService = mockTemplateService();
     emailProvider = mockEmailProvider();
 
     module = await Test.createTestingModule({
@@ -111,6 +137,8 @@ describe("NotificationService", () => {
         NotificationService,
         { provide: NotificationPreferencesRepository, useValue: prefsRepo },
         { provide: NotificationLogRepository, useValue: logRepo },
+        { provide: InAppNotificationRepository, useValue: inAppRepo },
+        { provide: TemplateVersionService, useValue: templateService },
         { provide: NOTIFICATION_PROVIDERS, useValue: [emailProvider] },
       ],
     }).compile();
@@ -118,7 +146,7 @@ describe("NotificationService", () => {
     await module.init();
 
     service = module.get(NotificationService);
-    
+
     // Ensure the service is fully initialized
     service.onModuleInit();
   });
@@ -287,6 +315,7 @@ describe("NotificationService", () => {
         "email",
         "payment.received",
         "tx-abc",
+        undefined,
       );
       expect(logRepo.markSent).toHaveBeenCalledWith(
         PUBLIC_KEY,
@@ -294,6 +323,8 @@ describe("NotificationService", () => {
         "payment.received",
         "tx-abc",
         "msg-1",
+        undefined,
+        undefined,
       );
     });
 
@@ -360,11 +391,13 @@ describe("NotificationService", () => {
     it("retries failed entries", async () => {
       logRepo.getPendingRetries.mockResolvedValue([
         {
+          id: "log-email-1",
           publicKey: PUBLIC_KEY,
           channel: "email",
           eventType: "payment.received",
           eventId: "tx-fail",
           attempts: 1,
+          sequence: 1,
         },
       ]);
       prefsRepo.getEnabledPreferences.mockResolvedValue([makeEmailPref()]);
@@ -378,11 +411,13 @@ describe("NotificationService", () => {
     it("skips retry if preference no longer exists for channel", async () => {
       logRepo.getPendingRetries.mockResolvedValue([
         {
+          id: "log-push-1",
           publicKey: PUBLIC_KEY,
           channel: "push",
           eventType: "payment.received",
           eventId: "tx-fail",
           attempts: 1,
+          sequence: 1,
         },
       ]);
       // User only has email pref now, not push

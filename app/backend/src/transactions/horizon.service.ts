@@ -1,8 +1,14 @@
-import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
-import { Horizon } from 'stellar-sdk';
+import { Injectable, Logger, HttpException, HttpStatus, Optional } from '@nestjs/common';
+import { Horizon } from '@stellar/stellar-sdk';
+import * as StellarSdk from '@stellar/stellar-sdk';
 import { LRUCache } from 'lru-cache';
 import { AppConfigService } from '../config/app-config.service';
 import { TransactionItemDto, TransactionResponseDto } from './dto/transaction.dto';
+import { throwMappedStellarException } from '../common/stellar-errors';
+import {
+  CORRELATION_ID_HEADER,
+  getCurrentCorrelationId,
+} from '../common/context/correlation.context';
 
 @Injectable()
 export class HorizonService {
@@ -13,8 +19,21 @@ export class HorizonService {
     private readonly maxRetries = 3;
     private readonly baseDelay = 50; // 50ms — keeps all retries well within Jest's 5s timeout
     private readonly maxDelay = 30000;
+    private readonly circuitBreakerService: CircuitBreakerService | null;
+    private readonly redisCache: RedisCacheService | null;
+    private readonly fallbackCircuit: CircuitBreaker | null;
 
-    constructor(private readonly configService: AppConfigService) {
+    constructor(
+        private readonly configService: AppConfigService,
+        @Optional() circuitBreakerService?: CircuitBreakerService,
+        @Optional() redisCache?: RedisCacheService,
+    ) {
+        this.circuitBreakerService = circuitBreakerService ?? null;
+        this.redisCache = redisCache ?? null;
+        // Local, dependency-free circuit breaker used when the global
+        // CircuitBreakerService is not injected (e.g. isolated unit tests).
+        this.fallbackCircuit = this.circuitBreakerService ? null : new CircuitBreaker();
+
         const horizonUrl = this.configService.network === 'mainnet'
             ? 'https://horizon.stellar.org'
             : 'https://horizon-testnet.stellar.org';
@@ -36,6 +55,44 @@ export class HorizonService {
         this.logger.log(`Cache configured: max=${this.cache.max}, ttl=${this.cache.ttl}ms`);
     }
 
+    private getCircuit(): CircuitBreaker {
+        if (this.circuitBreakerService) return this.circuitBreakerService.horizon;
+        return this.fallbackCircuit!;
+    }
+
+    private recordCircuitFailure(): void {
+        this.getCircuit().onFailure();
+        this.circuitBreakerService?.snapshotMetrics();
+    }
+
+    private recordCircuitSuccess(): void {
+        this.getCircuit().onSuccess();
+        this.circuitBreakerService?.snapshotMetrics();
+    }
+
+    private async readCache(cacheKey: string): Promise<TransactionResponseDto | undefined> {
+        if (this.redisCache) {
+            try {
+                const redis = await this.redisCache.get<TransactionResponseDto>(`horizon:${cacheKey}`);
+                if (redis) return redis;
+            } catch {
+                // fall through to in-memory cache
+            }
+        }
+        return this.cache.get(cacheKey);
+    }
+
+    private async writeCache(cacheKey: string, value: TransactionResponseDto): Promise<void> {
+        this.cache.set(cacheKey, value);
+        if (this.redisCache) {
+            try {
+                await this.redisCache.set(`horizon:${cacheKey}`, value, 60_000);
+            } catch {
+                // in-memory cache already populated — safe to ignore
+            }
+        }
+    }
+
     async getPayments(
         accountId: string,
         asset?: string,
@@ -45,10 +102,25 @@ export class HorizonService {
         const cacheKey = `${this.configService.network}:${accountId}:${asset ?? 'any'}:${limit}:${cursor ?? 'start'}`;
 
         // Check cache first
-        const cached = this.cache.get(cacheKey);
+        const cached = await this.readCache(cacheKey);
         if (cached) {
-            this.logger.debug(`Cache hit for key: ${cacheKey}`);
+            this.logger.debug('Horizon payment cache hit');
             return cached;
+        }
+
+        // If the circuit is open, serve Redis-cached data (TTL 60s) instead
+        // of hitting the (presumably failing) Horizon API.
+        if (!this.getCircuit().isAllowed()) {
+            this.logger.warn('Horizon circuit open — serving cached payment data');
+            const fallback = await this.readCache(cacheKey);
+            if (fallback) return fallback;
+            throw new HttpException(
+                {
+                    statusCode: HttpStatus.SERVICE_UNAVAILABLE,
+                    error: 'Horizon service unavailable (circuit breaker open).',
+                },
+                HttpStatus.SERVICE_UNAVAILABLE,
+            );
         }
 
         // Check backoff status
@@ -58,7 +130,7 @@ export class HorizonService {
             const delay = this.calculateDelay(backoffInfo.attempts);
 
             if (timeSinceLastAttempt < delay) {
-                this.logger.warn(`Backoff in effect for key: ${cacheKey}. Delay: ${delay}ms`);
+                this.logger.warn(`Horizon payment backoff in effect. Delay: ${delay}ms`);
                 const secondsToWait = ((delay - timeSinceLastAttempt) / 1000).toFixed(3);
                 // Object WITHOUT a "message" key → NestJS sets this.message = "Http Exception".
                 // This matches .toThrow(new HttpException(expect.stringContaining(...), status))
@@ -86,11 +158,13 @@ export class HorizonService {
         try {
             const result = await this.fetchFromHorizonWithRetry(accountId, asset, limit, cursor, cacheKey);
 
+            this.recordCircuitSuccess();
+
             if (!wasInBackoff) {
-                this.cache.set(cacheKey, result);
-                this.logger.debug(`Cached result for key: ${cacheKey}`);
+                await this.writeCache(cacheKey, result);
+                this.logger.debug('Cached Horizon payment response');
             } else {
-                this.logger.debug(`Skipping cache on backoff-recovery call for key: ${cacheKey}`);
+                this.logger.debug('Skipping Horizon cache on backoff recovery');
             }
 
             return result;
@@ -98,8 +172,33 @@ export class HorizonService {
             const status = (error as { response?: { status?: number } })?.response?.status;
             if (status === 429 || (typeof status === 'number' && status >= 500)) {
                 this.updateBackoff(cacheKey);
+                this.recordCircuitFailure();
             }
             this.handleHorizonError(error);
+        }
+    }
+
+    async loadAccount(publicKey: string): Promise<StellarSdk.Account> {
+        try {
+            return await this.server.loadAccount(publicKey);
+        } catch (error) {
+            throw error;
+        }
+    }
+
+    async submitSignedTransaction(transaction: StellarSdk.Transaction): Promise<{ hash: string }> {
+        const result = await this.server.submitTransaction(transaction);
+        return { hash: result.hash };
+    }
+
+    async findTransaction(hash: string): Promise<{ hash: string } | null> {
+        try {
+            const result = await this.server.transactions().transaction(hash).call();
+            return { hash: result.hash };
+        } catch (error) {
+            const status = (error as { response?: { status?: number } })?.response?.status;
+            if (status === 404) return null;
+            throw error;
         }
     }
 
@@ -124,6 +223,7 @@ export class HorizonService {
                     query = query.cursor(cursor);
                 }
 
+                this.propagateCorrelationId();
                 const response = await query.call();
                 const records = response.records;
 
@@ -144,7 +244,7 @@ export class HorizonService {
                             const tx = await payment.transaction();
                             memo = tx.memo;
                         } catch {
-                            this.logger.warn(`Failed to fetch memo for transaction ${payment.transaction_hash}`);
+                            this.logger.warn('Failed to fetch payment memo');
                         }
 
                         let assetString = 'XLM';
@@ -152,11 +252,19 @@ export class HorizonService {
                             assetString = `${payment.asset_code}:${payment.asset_issuer}`;
                         }
 
+                        const isSuccessful =
+                            'transaction_successful' in payment
+                                ? Boolean(payment.transaction_successful)
+                                : true;
+
                         return {
                             amount: payment.amount,
                             asset: assetString,
                             memo,
                             timestamp: payment.created_at,
+                            source: payment.from,
+                            destination: payment.to,
+                            status: isSuccessful ? 'Success' : 'Pending',
                             txHash: payment.transaction_hash,
                             pagingToken: payment.paging_token,
                         };
@@ -169,7 +277,7 @@ export class HorizonService {
 
                 return {
                     items: filteredItems,
-                    nextCursor: records.length > 0
+                    nextCursor: records.length >= limit
                         ? records[records.length - 1].paging_token
                         : undefined,
                 };
@@ -212,50 +320,20 @@ export class HorizonService {
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
-    private handleHorizonError(error: unknown): never {
-        const err = error as { response?: { status: number; data: unknown }; message?: string };
+    /**
+     * Attach the current request correlation ID to every Horizon request before
+     * it is issued. Unset when no request scope is active (e.g. background jobs).
+     */
+    private propagateCorrelationId(): void {
+        const correlationId = getCurrentCorrelationId();
+        if (!correlationId) return;
+        // `httpClient` may be unavailable when the SDK is partially stubbed.
+        if (!this.server.httpClient?.defaults?.headers) return;
+        this.server.httpClient.defaults.headers[CORRELATION_ID_HEADER] = correlationId;
+    }
 
-        if (err.response) {
-            const status = err.response.status;
-
-            switch (status) {
-                case 429:
-                    this.logger.error('Horizon rate limit exceeded');
-                    throw new HttpException(
-                        'Horizon service rate limit exceeded. Please try again later.',
-                        HttpStatus.SERVICE_UNAVAILABLE,
-                    );
-
-                case 502:
-                case 503:
-                case 504:
-                    this.logger.error(`Horizon service unavailable: ${status}`);
-                    throw new HttpException(
-                        'Horizon service temporarily unavailable. Please try again later.',
-                        HttpStatus.SERVICE_UNAVAILABLE,
-                    );
-
-                case 500:
-                    this.logger.error(`Horizon internal server error: ${status}`);
-                    throw new HttpException(
-                        'Horizon service encountered an internal error.',
-                        HttpStatus.BAD_GATEWAY,
-                    );
-
-                default:
-                    this.logger.error(`Horizon client error: ${status} - ${JSON.stringify(err.response.data)}`);
-                    throw new HttpException(
-                        'Invalid request to Horizon service',
-                        HttpStatus.BAD_REQUEST,
-                    );
-            }
-        }
-
-        this.logger.error(`Unexpected error fetching from Horizon: ${err.message || String(error)}`);
-        throw new HttpException(
-            'Internal server error while fetching transactions',
-            HttpStatus.INTERNAL_SERVER_ERROR,
-        );
+    private handleHorizonError(error: unknown, traceId?: string): never {
+      throwMappedStellarException(error, traceId);
     }
 
     getCacheStats() {

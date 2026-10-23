@@ -2,8 +2,12 @@
 // Channels
 // ---------------------------------------------------------------------------
 
-export type NotificationChannel = "email" | "push" | "webhook";
-
+export type NotificationChannel =
+  | "email"
+  | "push"
+  | "webhook"
+  | "telegram"
+  | "in_app";
 // ---------------------------------------------------------------------------
 // Notification domain events
 // These extend the Stellar ingestion events with classic payment/username events.
@@ -14,7 +18,26 @@ export type NotificationEventType =
   | "EscrowWithdrawn"
   | "EscrowRefunded"
   | "payment.received"
-  | "username.claimed";
+  | "username.claimed"
+  | "recurring.payment.due"
+  | "recurring.payment.executed"
+  | "recurring.payment.failed"
+  | "recurring.payment.cancelled"
+  | "recurring.link.created"
+  | "recurring.link.updated"
+  | "recurring.link.paused"
+  | "recurring.link.resumed"
+  | "recurring.link.completed"
+  | "auto_reconciliation.succeeded"
+  | "payment.link.expired";
+
+export type PaymentLinkExpiredEvent = "payment.link.expired";
+
+export interface PaymentLinkExpiredPayload extends BaseNotificationPayload {
+  eventType: PaymentLinkExpiredEvent;
+  linkId: string;
+  expiredAt: string | null;
+}
 
 export interface BaseNotificationPayload {
   /** The event kind — used to match against user preference filters. */
@@ -33,6 +56,10 @@ export interface BaseNotificationPayload {
   amountStroops?: bigint;
   /** Arbitrary extra context for provider templates. */
   metadata?: Record<string, unknown>;
+  /** Preview scope identifier when the event originated from a preview environment. */
+  previewScope?: string;
+  /** Correlation id of the originating request, propagated for end-to-end tracing. */
+  correlationId?: string;
 }
 
 export interface EscrowDepositedPayload extends BaseNotificationPayload {
@@ -47,6 +74,72 @@ export interface EscrowWithdrawnPayload extends BaseNotificationPayload {
   commitment: string;
   token: string;
   amountStroops: bigint;
+}
+
+// ---------------------------------------------------------------------------
+// Recurring Payment Notification Payloads
+// ---------------------------------------------------------------------------
+
+export interface RecurringPaymentDuePayload extends BaseNotificationPayload {
+  eventType: "recurring.payment.due";
+  linkId: string;
+  executionId: string;
+  username?: string;
+  destination?: string;
+  amount: number;
+  asset: string;
+  periodNumber: number;
+  scheduledAt: string;
+}
+
+export interface RecurringPaymentExecutedPayload extends BaseNotificationPayload {
+  eventType: "recurring.payment.executed";
+  linkId: string;
+  executionId: string;
+  username?: string;
+  destination?: string;
+  amount: number;
+  asset: string;
+  periodNumber: number;
+  transactionHash: string;
+}
+
+export interface RecurringPaymentFailedPayload extends BaseNotificationPayload {
+  eventType: "recurring.payment.failed";
+  linkId: string;
+  executionId: string;
+  username?: string;
+  destination?: string;
+  amount: number;
+  asset: string;
+  periodNumber: number;
+  failureReason: string;
+  retryCount: number;
+  permanent: boolean;
+}
+
+export interface RecurringPaymentNotificationEvent {
+  eventType: 'recurring.payment.executed' | 'recurring.payment.failed';
+  eventId: string;
+  recipientPublicKey: string;
+  linkId: string;
+  executionId: string;
+  amount: number;
+  asset: string;
+  periodNumber: number;
+  transactionHash?: string;
+  failureReason?: string;
+  retryCount?: number;
+  permanent?: boolean;
+  occurredAt: string;
+}
+
+export interface RecurringLinkStatusPayload extends BaseNotificationPayload {
+  eventType: NotificationEventType;
+  linkId: string;
+  username?: string;
+  destination?: string;
+  status: string;
 }
 
 export interface EscrowRefundedPayload extends BaseNotificationPayload {
@@ -68,12 +161,27 @@ export interface UsernameClaimedPayload extends BaseNotificationPayload {
   username: string;
 }
 
+export interface AutoReconciliationSucceededNotificationPayload extends BaseNotificationPayload {
+  eventType: "auto_reconciliation.succeeded";
+  linkId: string;
+  txHash: string;
+  assetCode: string;
+  /** 0–100 confidence score that triggered the auto-match. */
+  confidence: number;
+}
+
 export type NotificationPayload =
   | EscrowDepositedPayload
   | EscrowWithdrawnPayload
   | EscrowRefundedPayload
   | PaymentReceivedPayload
-  | UsernameClaimedPayload;
+  | UsernameClaimedPayload
+  | RecurringPaymentDuePayload
+  | RecurringPaymentExecutedPayload
+  | RecurringPaymentFailedPayload
+  | RecurringLinkStatusPayload
+  | AutoReconciliationSucceededNotificationPayload
+  | PaymentLinkExpiredPayload;
 
 // ---------------------------------------------------------------------------
 // User preferences
@@ -86,7 +194,20 @@ export interface NotificationPreference {
   email?: string;
   pushToken?: string;
   webhookUrl?: string;
-  /** null = all events; otherwise only listed event types trigger notifications */
+  webhookSecret?: string;
+  /**
+   * Webhook API version this subscriber is pinned to (issue #275).
+   * Absent means the default version; see `webhook-event-versions.ts`.
+   */
+  apiVersion?: string;
+  /**
+   * Previous signing secret retained during a rotation overlap window
+   * (issue #277). Signatures are always produced with `webhookSecret`; this
+   * only extends verification so an in-flight consumer does not break.
+   */
+  previousWebhookSecret?: string;
+  /** When the previous secret stops being accepted. */
+  previousSecretExpiresAt?: string;
   events: NotificationEventType[] | null;
   minAmountStroops: bigint;
   enabled: boolean;
@@ -110,4 +231,47 @@ export interface NotificationLogEntry {
   providerMessageId?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+// ---------------------------------------------------------------------------
+// Webhook-specific types
+// ---------------------------------------------------------------------------
+
+export interface WebhookPayload {
+  id: string;
+  eventType: NotificationEventType;
+  eventId: string;
+  /** Webhook API version this payload was rendered for (issue #275). */
+  apiVersion: string;
+  /** Schema version of the specific event type (issue #275). */
+  version: string;
+  timestamp: string;
+  sentAt: string;
+  recipientPublicKey: string;
+  title: string;
+  body: string;
+  data: Record<string, unknown>;
+  /** Present only when the subscriber is behind the current schema. */
+  migration?: {
+    eventType: string;
+    deliveredVersion: string;
+    currentVersion: string;
+    deprecated: boolean;
+    sunsetAt?: string;
+    migration?: string;
+  };
+}
+
+export interface WebhookDeliveryResult {
+  success: boolean;
+  httpStatus?: number;
+  responseBody?: string;
+  error?: string;
+}
+
+export interface WebhookStats {
+  totalSent: number;
+  totalFailed: number;
+  lastDeliveryAt?: string;
+  lastError?: string;
 }

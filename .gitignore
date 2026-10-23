@@ -26,6 +26,8 @@ package-json.lock
 # Tests
 /coverage
 /.nyc_output
+release-scorecard.json
+release-scorecard.md
 
 # IDEs and editors
 /.idea
@@ -73,3 +75,22 @@ reports/mutation/
 # Keep reports directory but ignore contents
 reports/*
 !reports/.gitkeep
+kp.json
+.turbo/
+.claude/
+local-commit-pr-notes.md
+feat/be-release-pipeline
+.turbo
+
+# Deployment scripts - Issue-specific commit scripts
+commit_*.ps1
+commit_*.sh
+
+main
+.opencode
+
+# Secret scanning
+# The .secrets.baseline IS committed (it tracks audited false-positives).
+# Temporary scan outputs and gitleaks reports are ignored.
+.secrets.baseline.new
+.gitleaks-report.json

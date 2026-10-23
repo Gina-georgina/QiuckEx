@@ -1,0 +1,244 @@
+name: CI Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  validate:
+    name: Validate (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - "@quickex/backend"
+          - "frontend"
+          - "mobile"
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+
+      - name: Cache Turbo build cache
+        uses: actions/cache@v4
+        with:
+          path: .turbo/cache
+          key: ${{ runner.os }}-turbo-${{ matrix.package }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-turbo-${{ matrix.package }}-
+            ${{ runner.os }}-turbo-
+
+      # Forces pnpm to link all internal binaries across packages properly
+      - name: Install Dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Verify contract metadata and deployment gates
+        if: matrix.package == '@quickex/backend'
+        run: |
+          pnpm check:contract-metadata-drift
+          node --test scripts/check-contract-metadata-drift.test.js scripts/verify-mainnet-deployment-gate.test.js scripts/rollback-migration.test.js
+
+      # Affected-package execution with Turbo caching
+      - name: Run CI tasks for ${{ matrix.package }}
+        run: |
+          BASE_REF="${{ github.base_ref || 'main' }}"
+          git fetch origin "$BASE_REF" --depth=1 2>/dev/null || true
+
+          echo "Evaluating affected execution for ${{ matrix.package }} against origin/$BASE_REF"
+          pnpm turbo run lint type-check test build \
+            --filter="${{ matrix.package }}...[origin/$BASE_REF]" \
+            --cache-dir=".turbo/cache" || \
+          pnpm turbo run lint type-check test build \
+            --filter="${{ matrix.package }}..." \
+            --cache-dir=".turbo/cache"
+
+  # ── Database migration smoke test (issue #440) ──────────────────────────
+  # Spins up a fresh temporary Supabase test schema, applies all migrations in
+  # sequential order via run-migration-supabase.js, asserts the final schema
+  # matches the expected state, and tests rolling back the most recent migration.
+  migration-smoke-test:
+    name: Migration Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Check for supabase/migrations changes
+        id: migration-diff
+        run: |
+          BASE_REF="${{ github.base_ref || 'main' }}"
+          git fetch origin "$BASE_REF" --depth=1 2>/dev/null || true
+          CHANGED=$(git diff --name-only "origin/$BASE_REF...HEAD" 2>/dev/null | grep -E '(^|/)supabase/migrations/|run-migration-supabase\.js|rollback-migration' || true)
+          if [ -n "$CHANGED" ]; then
+            echo "touched=true" >> "$GITHUB_OUTPUT"
+            echo "Detected migration changes:"
+            echo "$CHANGED"
+          else
+            echo "touched=false" >> "$GITHUB_OUTPUT"
+            echo "No direct supabase/migrations/ diff detected; running baseline smoke test."
+          fi
+
+      - name: Run fresh-schema migration smoke test (run-migration-supabase.js)
+        env:
+          MIGRATION_SMOKE_TEST: "1"
+          MIGRATION_TEST_SCHEMA: "migration_smoke_test"
+          MIGRATION_STATE_FILE: "/tmp/quickex-migration-smoke-db.json"
+        run: |
+          node app/backend/run-migration-supabase.js \
+            --smoke-test \
+            --schema migration_smoke_test \
+            --state-file /tmp/quickex-migration-smoke-db.json
+
+      - name: Verify rollback of most recent migration and re-apply idempotency
+        run: |
+          ./scripts/rollback-migration.sh \
+            --schema migration_smoke_test \
+            --state-file /tmp/quickex-migration-smoke-db.json
+          node app/backend/run-migration-supabase.js \
+            --schema migration_smoke_test \
+            --state-file /tmp/quickex-migration-smoke-db.json
+
+      - name: Run migration and rollback unit test suite
+        run: |
+          node app/backend/scripts/verify-migrations.js
+          node --test scripts/rollback-migration.test.js
+
+  # -- Documentation gate (issue #295) ---------------------------------------
+  # Validates that docs/openapi.json, the contract map, and the mobile env docs
+  # still describe the API the repository implements. Static only, so it needs
+  # neither the backend running nor an install.
+  docs-gate:
+    name: Documentation Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run documentation gate
+        run: node scripts/docs-check/check.mjs
+
+      - name: Test the documentation gate
+        run: node --test scripts/docs-check/__tests__/docs.test.mjs
+
+  # ── Governance gate (issues #306-#309) ────────────────────────────────────
+  # Dependency-free: validates ADRs, asset listing policy, retention schedule and
+  # the a11y/i18n standard before anything is installed.
+  governance:
+    name: Governance Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run governance gate
+        run: node scripts/governance/check.mjs
+
+      - name: Test the governance gate
+        run: node --test scripts/governance/__tests__/governance.test.mjs
+
+  # ── Secret scanning (lightweight check in main CI) ──────────────────────
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install detect-secrets
+        run: pip install detect-secrets
+
+      - name: Scan for new secrets
+        run: |
+          if [ -f .secrets.baseline ]; then
+            detect-secrets scan \
+              --baseline .secrets.baseline \
+              --exclude-files '(pnpm-lock\.yaml|package-lock\.json|.*\.lock|node_modules/.*|dist/.*|coverage/.*|.turbo/.*)' \
+              .
+          else
+            echo "::warning::No .secrets.baseline found. Run './scripts/secret-scan.sh' locally to generate one."
+            detect-secrets scan \
+              --exclude-files '(pnpm-lock\.yaml|package-lock\.json|.*\.lock|node_modules/.*|dist/.*|coverage/.*|.turbo/.*)' \
+              . > /tmp/secrets-check.json
+            python3 -c "
+          import json, sys
+          d = json.load(open('/tmp/secrets-check.json'))
+          findings = sum(len(v) for v in d.get('results', {}).values())
+          if findings > 0:
+              print(f'::error::{findings} potential secret(s) found!')
+              sys.exit(1)
+          print('No secrets detected.')
+          "
+          fi
+
+      - name: Check for .env files
+        run: |
+          VIOLATIONS=$(git diff --name-only --diff-filter=ACMR HEAD~1 HEAD 2>/dev/null | grep -E '(^|/)\.env($|\.local$|\.development$|\.production$)' || true)
+          if [ -n "$VIOLATIONS" ]; then
+            echo "::error::.env files must not be committed: $VIOLATIONS"
+            exit 1
+          fi
+          echo "No .env files in changes. ✓"
+
+  # ── Release Quality Scorecard Generation & Publishing ───────────────────
+  scorecard:
+    name: Release Quality Scorecard
+    runs-on: ubuntu-latest
+    needs: [validate, migration-smoke-test, secret-scan]
+    if: always()
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Generate Release Scorecard
+        run: |
+          node scripts/generate-release-scorecard.mjs --summary --output release-scorecard.md --json release-scorecard.json
+
+      - name: Upload Release Scorecard Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-quality-scorecard
+          path: |
+            release-scorecard.md
+            release-scorecard.json

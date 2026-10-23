@@ -8,18 +8,21 @@
 //!
 //! | Key Variant            | Value Type     | Description |
 //! |------------------------|----------------|-------------|
-//! | [`Escrow`](DataKey::Escrow) | `EscrowEntry`  | Escrow entry keyed by commitment hash (32 bytes). One entry per unique deposit. |
+//! | [`Escrow`](DataKey::Escrow) | `EscrowEntry`  | Legacy escrow entry keyed by commitment hash (32 bytes). Read as a fallback during lazy migration. |
+//! | [`EscrowCore`](DataKey::EscrowCore) | `CompactEscrowEntry` | Compact escrow record used for new writes and hot-path reads. |
+//! | [`EscrowDispute`](DataKey::EscrowDispute) | `EscrowDisputeConfig` | Optional dispute-only metadata written only when an escrow uses arbiters. |
 //! | [`EscrowCounter`](DataKey::EscrowCounter) | `u64`       | Global monotonic counter for escrow creation. |
+//! | [`ContractVersion`](DataKey::ContractVersion) | `u32` | Stored schema/version marker for upgrade migrations. |
 //! | [`Admin`](DataKey::Admin) | `Address`     | Contract admin address. Set during initialisation, transferable by admin. |
 //! | [`Paused`](DataKey::Paused) | `bool`       | Global pause flag. When true, critical operations may be blocked. |
 //! | [`PrivacyLevel`](DataKey::PrivacyLevel) | `u32`  | Numeric privacy level per account (0 = off). Used by `enable_privacy`. |
 //! | [`PrivacyHistory`](DataKey::PrivacyHistory) | `Vec<u32>` | Per-account history of privacy level changes (chronological). |
 //!
-//! ## Related Keys (outside `DataKey`)
+//! ## Related Keys (legacy compatibility)
 //!
 //! | Key                    | Format                    | Value Type | Description |
 //! |------------------------|---------------------------|------------|-------------|
-//! | `privacy_enabled`      | `(Symbol, Address)`       | `bool`     | Boolean privacy on/off per account. Used by `set_privacy` / `get_privacy`. |
+//! | `privacy_enabled`      | `(Symbol, Address)`       | `bool`     | Legacy boolean privacy on/off key. Read as a fallback and migrated to [`DataKey::PrivacyEnabled`] on write. |
 //!
 //! ## Relations
 //!
@@ -28,7 +31,7 @@
 //!   status, and created_at.
 //! - **Admin ↔ Paused**: Admin can set the paused flag. Both are singleton keys.
 //! - **PrivacyLevel ↔ PrivacyHistory**: Same account may have both; level is current, history is append-only.
-//! - **PrivacyLevel / PrivacyHistory ↔ privacy_enabled**: Separate APIs; level-based vs boolean. Both persist per `Address`.
+//! - **PrivacyLevel / PrivacyHistory ↔ PrivacyEnabled**: Separate APIs; level-based vs boolean. Both persist per `Address`.
 //!
 //! ## Backwards Compatibility
 //!
@@ -37,19 +40,94 @@
 //! - **Add** new variants for new keys; they will not collide with existing ones.
 //! - **Value layout**: Changing `EscrowEntry` fields may require migration logic; adding optional
 //!   fields can be done carefully with defaults.
+//! - **Lazy migration**: Reads still fall back to the legacy [`DataKey::Escrow`] payload.
+//!   Any subsequent write rewrites the escrow into the compact layout and removes the
+//!   legacy record.
 
-use soroban_sdk::{contracttype, Address, Bytes, Env, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Map, Vec};
 
-use crate::types::EscrowEntry;
+#[cfg(test)]
+use soroban_sdk::xdr::ToXdr;
+
+use crate::types::{
+    CachedOraclePrice, DisputeVote, EscrowEntry, FeeConfig, Role, StealthEscrowEntry,
+    TtlExtensionFeeConfig,
+};
+
+/// Record type for TTL policy selection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecordType {
+    Escrow,
+    EscrowDispute,
+    FeeConfig,
+    StealthEscrow,
+    EscrowIdMap,
+}
+
+/// TTL policy configuration.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TtlPolicy {
+    /// Threshold in ledgers for TTL extension.
+    pub threshold: u32,
+    /// TTL in ledgers for this record type.
+    pub ttl: u32,
+}
+
+/// Get TTL policy for a given record type.
+fn get_ttl_policy(record_type: RecordType) -> TtlPolicy {
+    match record_type {
+        RecordType::Escrow => TtlPolicy {
+            threshold: LEDGER_THRESHOLD,
+            ttl: SIX_MONTHS_IN_LEDGERS,
+        },
+        RecordType::EscrowDispute => TtlPolicy {
+            threshold: LEDGER_THRESHOLD,
+            ttl: SIX_MONTHS_IN_LEDGERS,
+        },
+        RecordType::FeeConfig => TtlPolicy {
+            threshold: LEDGER_THRESHOLD,
+            ttl: SIX_MONTHS_IN_LEDGERS,
+        },
+        RecordType::StealthEscrow => TtlPolicy {
+            threshold: LEDGER_THRESHOLD,
+            ttl: SIX_MONTHS_IN_LEDGERS,
+        },
+        RecordType::EscrowIdMap => TtlPolicy {
+            threshold: LEDGER_THRESHOLD,
+            ttl: SIX_MONTHS_IN_LEDGERS,
+        },
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Key constants (for keys not using DataKey)
 // -----------------------------------------------------------------------------
 
-/// Symbol string for the boolean privacy-enabled flag.
+/// Symbol string for the legacy boolean privacy-enabled flag.
 /// Used as `(Symbol::new(env, PRIVACY_ENABLED_KEY), Address)` in persistent storage.
-/// See [`crate::privacy`] module.
+/// See [`crate::privacy`] module for fallback/migration behaviour.
 pub const PRIVACY_ENABLED_KEY: &str = "privacy_enabled";
+
+pub const LEGACY_CONTRACT_VERSION: u32 = 0;
+pub const CURRENT_CONTRACT_VERSION: u32 = 1;
+pub const LEGACY_SCHEMA_VERSION: u32 = 0;
+pub const SCHEMA_VERSION: u32 = 1;
+
+pub const LEDGER_THRESHOLD: u32 = 17280; // ~1 day
+pub const SIX_MONTHS_IN_LEDGERS: u32 = 3110400; // ~185 days
+
+/// Bitmask flags for granular operation pausing.
+#[contracttype]
+#[repr(u64)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PauseFlag {
+    Deposit = 1,
+    Withdrawal = 2,
+    Refund = 4,
+    DepositWithCommitment = 8,
+    SetPrivacy = 16,
+    CreateAmountCommitment = 32,
+}
 
 // -----------------------------------------------------------------------------
 // DataKey enum – central key derivation
@@ -63,18 +141,490 @@ pub const PRIVACY_ENABLED_KEY: &str = "privacy_enabled";
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    /// Escrow entry keyed by commitment hash (`Bytes`, typically 32 bytes).
+    /// Legacy escrow entry keyed by commitment hash (`Bytes`, typically 32 bytes).
+    /// Kept for backward-compatible reads after the storage compaction pass.
     Escrow(Bytes),
+    /// Compact escrow payload used for new and rewritten records.
+    EscrowCore(Bytes),
+    /// Optional dispute-only metadata for escrows that actually use arbiters.
+    EscrowDispute(Bytes),
     /// Global escrow counter (singleton).
     EscrowCounter,
+    /// TTL extension fee config (singleton).
+    TtlExtensionFeeConfig,
+    /// Current contract schema version (singleton).
+    ContractVersion,
     /// Admin address (singleton).
     Admin,
+    /// Explicit one-time initialization flag (singleton).
+    Initialized,
     /// Paused state (singleton).
     Paused,
+    /// Emergency mode (singleton, immutable once set true).
+    EmergencyMode,
+    /// Upgrade window start epoch (u64), in ledger timestamps. 0 = no window set.
+    UpgradeWindowStart,
+    /// Upgrade window end epoch (u64), in ledger timestamps. 0 = no upper bound.
+    UpgradeWindowEnd,
+    /// Flag indicating an upgrade is in progress (between start_upgrade and complete_upgrade).
+    UpgradeInProgress,
     /// Numeric privacy level per account.
     PrivacyLevel(Address),
     /// Privacy level change history per account.
     PrivacyHistory(Address),
+    /// Stealth escrow entry keyed by the 32-byte stealth address (Privacy v2).
+    StealthEscrow(BytesN<32>),
+    /// Granular operation pause bitmask (singleton).
+    PauseFlags,
+    /// Reason code for global pause.
+    GlobalPauseReason,
+    /// Reason codes for feature-specific pauses.
+    FeaturePauseReasons,
+    /// Fee configuration (singleton).
+    FeeConfig,
+    /// Platform wallet address for fee collection (singleton).
+    PlatformWallet,
+    /// Oracle fee configuration for dynamic USD-based fees.
+    OracleFeeConfig,
+    /// Cached oracle price with timestamp for staleness guards.
+    CachedOraclePrice,
+    /// Registered hook contract addresses.
+    HookRegistry,
+    /// Reentrancy guard to prevent callback-based reentry during hook execution.
+    ReentrancyGuard,
+    /// Boolean privacy flag per account.
+    PrivacyEnabled(Address),
+    /// 32-byte WASM hash stored at the last `upgrade()` call (singleton).
+    WasmHash,
+    /// Maps a deterministic 32-byte `escrow_id` (see [`crate::escrow_id`])
+    /// to the commitment key of the escrow it identifies. Enables
+    /// idempotent deduplication of identical creation requests.
+    EscrowIdMap(BytesN<32>),
+    /// Roles assigned to an address.
+    UserRole(Address),
+    /// Per-asset fee override keyed by token address (Fee Router v2).
+    PerAssetFee(Address),
+    /// Current active fee collector rotation index (Fee Router v2, singleton).
+    FeeCollectorIndex,
+    /// Fee collector address at a given rotation index (Fee Router v2).
+    FeeCollector(u32),
+    /// Timestamp of the last fee collector rotation for cooldown enforcement (singleton).
+    FeeCollectorLastRotation,
+    /// Rotation history entries (append-only Vec tracking all rotations).
+    FeeCollectorRotationHistory,
+    /// Tracks arbiter votes for disputed escrows. Keyed by (commitment, arbiter).
+    DisputeVote(Bytes, Address),
+    /// Tracks whether a hook contract is on the allowlist.
+    HookAllowlist(Address),
+    /// Escrow extension record tracking TTL renewals. Keyed by commitment.
+    EscrowExtension(Bytes),
+    /// Dispute evidence record. Keyed by (commitment, evidence_hash).
+    DisputeEvidence(Bytes, BytesN<32>),
+    /// Multi-signature admin signer set (singleton).
+    AdminSigners,
+    /// Number of required admin signatures (singleton).
+    AdminThreshold,
+    /// Current multi-signature approval round (singleton).
+    AdminApprovalRound,
+    /// Number of approvals in the current round (singleton).
+    AdminApprovalCount,
+    /// Whether the current approval round has reached quorum (singleton).
+    AdminApprovalReady,
+    /// Round in which an address last approved an admin action.
+    AdminSignerApprovalRound(Address),
+    /// Stored contract storage schema version (singleton).
+    SchemaVersion,
+}
+
+/// Compact escrow record stored on the hot path.
+///
+/// Dispute metadata is intentionally split into a separate record so the common
+/// no-arbiter escrow avoids paying storage rent for empty optional fields.
+#[contracttype]
+#[derive(Clone)]
+struct CompactEscrowEntry {
+    token: Address,
+    amount_due: i128,
+    amount_paid: i128,
+    owner: Address,
+    status: crate::types::EscrowStatus,
+    created_at: u64,
+    expires_at: u64,
+}
+
+impl CompactEscrowEntry {
+    fn from_public(entry: &EscrowEntry) -> Self {
+        Self {
+            token: entry.token.clone(),
+            amount_due: entry.amount_due,
+            amount_paid: entry.amount_paid,
+            owner: entry.owner.clone(),
+            status: entry.status,
+            created_at: entry.created_at,
+            expires_at: entry.expires_at,
+        }
+    }
+
+    fn into_public(self, env: &Env, dispute: EscrowDisputeConfig) -> EscrowEntry {
+        EscrowEntry {
+            token: self.token,
+            amount_due: self.amount_due,
+            amount_paid: self.amount_paid,
+            owner: self.owner,
+            status: self.status,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            arbiter: dispute.arbiter,
+            arbiters: dispute.arbiters,
+            arbiter_threshold: dispute.arbiter_threshold,
+            memo: None,
+            milestones: Vec::new(env),
+        }
+    }
+}
+
+/// Dispute-only escrow metadata stored separately from the hot-path core record.
+#[contracttype]
+#[derive(Clone)]
+struct EscrowDisputeConfig {
+    arbiter: Option<Address>,
+    arbiters: Vec<Address>,
+    arbiter_threshold: u32,
+}
+
+impl EscrowDisputeConfig {
+    fn empty(env: &Env) -> Self {
+        Self {
+            arbiter: None,
+            arbiters: Vec::new(env),
+            arbiter_threshold: 0,
+        }
+    }
+
+    fn from_public(env: &Env, entry: &EscrowEntry) -> Self {
+        Self {
+            arbiter: entry.arbiter.clone(),
+            arbiters: if entry.arbiters.is_empty() {
+                Vec::new(env)
+            } else {
+                entry.arbiters.clone()
+            },
+            arbiter_threshold: entry.arbiter_threshold,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.arbiter.is_none() && self.arbiters.is_empty() && self.arbiter_threshold == 0
+    }
+}
+
+fn legacy_escrow_key(commitment: &Bytes) -> DataKey {
+    DataKey::Escrow(commitment.clone())
+}
+
+fn compact_escrow_key(commitment: &Bytes) -> DataKey {
+    DataKey::EscrowCore(commitment.clone())
+}
+
+fn escrow_dispute_key(commitment: &Bytes) -> DataKey {
+    DataKey::EscrowDispute(commitment.clone())
+}
+
+fn get_escrow_dispute_config(env: &Env, commitment: &Bytes) -> EscrowDisputeConfig {
+    let key = escrow_dispute_key(commitment);
+    let dispute = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| EscrowDisputeConfig::empty(env));
+
+    if !dispute.is_empty() {
+        set_or_extend_ttl(env, &key, RecordType::EscrowDispute);
+    }
+
+    dispute
+}
+
+fn put_escrow_dispute_config(env: &Env, commitment: &Bytes, entry: &EscrowEntry) {
+    let key = escrow_dispute_key(commitment);
+    let dispute = EscrowDisputeConfig::from_public(env, entry);
+
+    if dispute.is_empty() {
+        env.storage().persistent().remove(&key);
+        return;
+    }
+
+    env.storage().persistent().set(&key, &dispute);
+    set_or_extend_ttl(env, &key, RecordType::EscrowDispute);
+}
+
+fn extend_escrow_compaction_ttl(env: &Env, commitment: &Bytes) -> bool {
+    let core_key = compact_escrow_key(commitment);
+    if env.storage().persistent().has(&core_key) {
+        set_or_extend_ttl(env, &core_key, RecordType::Escrow);
+
+        let dispute_key = escrow_dispute_key(commitment);
+        if env.storage().persistent().has(&dispute_key) {
+            set_or_extend_ttl(env, &dispute_key, RecordType::EscrowDispute);
+        }
+
+        return true;
+    }
+
+    let legacy_key = legacy_escrow_key(commitment);
+    if env.storage().persistent().has(&legacy_key) {
+        set_or_extend_ttl(env, &legacy_key, RecordType::Escrow);
+        return true;
+    }
+
+    false
+}
+
+// -----------------------------------------------------------------------------
+// Emergency Mode helpers (module scope)
+// -----------------------------------------------------------------------------
+/// Set emergency mode. Once set to true, cannot be reverted.
+pub fn set_emergency_mode(env: &Env) {
+    let key = DataKey::EmergencyMode;
+    let already_set: bool = env.storage().persistent().get(&key).unwrap_or(false);
+    if !already_set {
+        env.storage().persistent().set(&key, &true);
+    }
+    // If already set, do nothing (immutable)
+}
+
+/// Get emergency mode state.
+pub fn is_emergency_mode(env: &Env) -> bool {
+    let key = DataKey::EmergencyMode;
+    env.storage().persistent().get(&key).unwrap_or(false)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Upgrade Window helpers (Issue #432)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Set the upgrade window: [start, end] in ledger seconds (epoch).
+/// - `start`: ledger timestamp when upgrades are allowed to begin. 0 = unset.
+/// - `end`: ledger timestamp after which upgrades are blocked. 0 = no upper bound.
+pub fn set_upgrade_window(env: &Env, start: u64, end: u64) -> Result<(), crate::errors::QuickexError> {
+    if end != 0 && end <= start {
+        return Err(crate::errors::QuickexError::InvalidAmount);
+    }
+    env.storage()
+        .persistent()
+        .set(&DataKey::UpgradeWindowStart, &start);
+    env.storage()
+        .persistent()
+        .set(&DataKey::UpgradeWindowEnd, &end);
+    Ok(())
+}
+
+/// Get the current upgrade window.
+pub fn get_upgrade_window(env: &Env) -> (u64, u64) {
+    let start = env
+        .storage()
+        .persistent()
+        .get(&DataKey::UpgradeWindowStart)
+        .unwrap_or(0u64);
+    let end = env
+        .storage()
+        .persistent()
+        .get(&DataKey::UpgradeWindowEnd)
+        .unwrap_or(0u64);
+    (start, end)
+}
+
+/// Check if upgrade window is currently active.
+pub fn is_upgrade_window_active(env: &Env) -> bool {
+    let (start, end) = get_upgrade_window(env);
+    if start == 0 {
+        return false; // No window set
+    }
+    let now = env.ledger().timestamp();
+    now >= start && (end == 0 || now < end)
+}
+
+/// Set upgrade-in-progress flag.
+pub fn set_upgrade_in_progress(env: &Env, in_progress: bool) {
+    env.storage()
+        .instance()
+        .set(&DataKey::UpgradeInProgress, &in_progress);
+    env.storage()
+        .instance()
+        .extend_ttl(LEDGER_THRESHOLD, SIX_MONTHS_IN_LEDGERS);
+}
+
+/// Get upgrade-in-progress flag.
+pub fn is_upgrade_in_progress(env: &Env) -> bool {
+    if let Some(in_progress) = env
+        .storage()
+        .instance()
+        .get(&DataKey::UpgradeInProgress)
+    {
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGER_THRESHOLD, SIX_MONTHS_IN_LEDGERS);
+        return in_progress;
+    }
+
+    let legacy_in_progress = env
+        .storage()
+        .persistent()
+        .get(&DataKey::UpgradeInProgress)
+        .unwrap_or(false);
+    if legacy_in_progress {
+        set_upgrade_in_progress(env, true);
+    }
+    legacy_in_progress
+}
+
+pub fn get_governance_config(env: &Env) -> Option<GovernanceConfig> {
+    if !governance_is_initialized(env) {
+        return None;
+    }
+    env.storage()
+        .instance()
+        .extend_ttl(LEDGER_THRESHOLD, SIX_MONTHS_IN_LEDGERS);
+    env.storage().instance().get(&DataKey::GovernanceConfig)
+}
+
+pub fn set_governance_config(env: &Env, config: &GovernanceConfig) {
+    env.storage().instance().set(&DataKey::GovernanceConfig, config);
+    env.storage().instance().set(&DataKey::GovernanceActivated, &true);
+    env.storage()
+        .instance()
+        .extend_ttl(LEDGER_THRESHOLD, SIX_MONTHS_IN_LEDGERS);
+}
+
+pub fn governance_is_initialized(env: &Env) -> bool {
+    let initialized = env.storage()
+        .instance()
+        .get(&DataKey::GovernanceActivated)
+        .unwrap_or(false);
+    if initialized {
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGER_THRESHOLD, SIX_MONTHS_IN_LEDGERS);
+    }
+    initialized
+}
+
+pub fn governance_execution_in_progress(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::GovernanceExecution)
+        .unwrap_or(false)
+}
+
+pub fn set_governance_execution(env: &Env, executing: bool) {
+    env.storage()
+        .instance()
+        .set(&DataKey::GovernanceExecution, &executing);
+    env.storage()
+        .instance()
+        .extend_ttl(LEDGER_THRESHOLD, SIX_MONTHS_IN_LEDGERS);
+}
+
+pub fn get_governance_proposal(env: &Env, proposal_id: u64) -> Option<GovernanceProposal> {
+    let key = DataKey::GovernanceProposal(proposal_id);
+    let proposal = env.storage().persistent().get(&key);
+    if proposal.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_THRESHOLD, SIX_MONTHS_IN_LEDGERS);
+    }
+    proposal
+}
+
+pub fn set_governance_proposal(env: &Env, proposal_id: u64, proposal: &GovernanceProposal) {
+    let key = DataKey::GovernanceProposal(proposal_id);
+    env.storage().persistent().set(&key, proposal);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_THRESHOLD, SIX_MONTHS_IN_LEDGERS);
+}
+
+pub fn next_governance_proposal_id(env: &Env) -> Option<u64> {
+    let current: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::GovernanceProposalCounter)
+        .unwrap_or(0);
+    let next = current.checked_add(1)?;
+    env.storage().instance().set(&DataKey::GovernanceProposalCounter, &next);
+    env.storage()
+        .instance()
+        .extend_ttl(LEDGER_THRESHOLD, SIX_MONTHS_IN_LEDGERS);
+    Some(next)
+}
+
+pub fn set_pending_upgrade_version(env: &Env, version: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingUpgradeVersion, &version);
+    env.storage()
+        .instance()
+        .extend_ttl(LEDGER_THRESHOLD, SIX_MONTHS_IN_LEDGERS);
+}
+
+pub fn get_pending_upgrade_version(env: &Env) -> Option<u32> {
+    let version = env
+        .storage()
+        .instance()
+        .get(&DataKey::PendingUpgradeVersion);
+    if version.is_some() {
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGER_THRESHOLD, SIX_MONTHS_IN_LEDGERS);
+    }
+    version
+}
+
+pub fn clear_pending_upgrade_version(env: &Env) {
+    env.storage()
+        .instance()
+        .remove(&DataKey::PendingUpgradeVersion);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Invariant Checking (Issue #432)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Assert critical post-upgrade invariants.
+///
+/// Called after migration to validate state machine and fee bounds.
+/// Returns `Ok(())` if all invariants hold; `Err(msg)` deterministically if violated.
+pub fn assert_post_upgrade_invariants(env: &Env) -> Result<(), &'static str> {
+    // Invariant 1: Fee bounds must be within [0, MAX_FEE_BPS] basis points.
+    let fee_cfg = get_fee_config(env);
+    if fee_cfg.fee_bps > crate::fee::MAX_FEE_BPS {
+        return Err("fee_bps exceeds maximum (10000)");
+    }
+
+    // Invariant 2: Contract and schema version must be set to CURRENT / SCHEMA_VERSION.
+    let version = get_contract_version(env);
+    if version != Some(CURRENT_CONTRACT_VERSION) {
+        return Err("contract version not set to current after migration");
+    }
+    let schema_version = get_schema_version(env);
+    if schema_version != Some(SCHEMA_VERSION) {
+        return Err("schema version not set to current after migration");
+    }
+
+    // Invariant 3: Admin must be initialized.
+    if get_admin(env).is_none() {
+        return Err("admin not initialized post-upgrade");
+    }
+
+    // Invariant 4: Escrow counter must remain non-negative (always true for u64).
+    let _counter = get_escrow_counter(env);
+    // Counter is u64, so this is always valid.
+
+    // Invariant 5: Per-asset fee bounds (if any exist).
+    // Note: We cannot iterate all per-asset fees here without a registry.
+    // This is validated per-write in set_per_asset_fee.
+
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -86,23 +636,109 @@ pub enum DataKey {
 /// **Contract**: Overwrites any existing entry for the same commitment.
 /// The commitment should be the 32-byte `SHA256(owner || amount || salt)` hash.
 pub fn put_escrow(env: &Env, commitment: &Bytes, entry: &EscrowEntry) {
-    let key = DataKey::Escrow(commitment.clone());
-    env.storage().persistent().set(&key, entry);
+    let compact_key = compact_escrow_key(commitment);
+    let compact_entry = CompactEscrowEntry::from_public(entry);
+
+    env.storage().persistent().set(&compact_key, &compact_entry);
+    set_or_extend_ttl(env, &compact_key, RecordType::Escrow);
+    put_escrow_dispute_config(env, commitment, entry);
+
+    // Lazy migration: once an escrow is rewritten, retire the legacy payload.
+    env.storage()
+        .persistent()
+        .remove(&legacy_escrow_key(commitment));
+}
+
+/// Remove an escrow entry from storage and reclaim the storage deposit.
+pub fn remove_escrow(env: &Env, commitment: &Bytes) {
+    env.storage()
+        .persistent()
+        .remove(&compact_escrow_key(commitment));
+    env.storage()
+        .persistent()
+        .remove(&escrow_dispute_key(commitment));
+    env.storage()
+        .persistent()
+        .remove(&legacy_escrow_key(commitment));
 }
 
 /// Get an escrow entry from storage.
 ///
 /// **Contract**: Returns `None` if no escrow exists for the commitment.
 pub fn get_escrow(env: &Env, commitment: &Bytes) -> Option<EscrowEntry> {
-    let key = DataKey::Escrow(commitment.clone());
-    env.storage().persistent().get(&key)
+    let compact_key = compact_escrow_key(commitment);
+    let compact_result: Option<CompactEscrowEntry> = env.storage().persistent().get(&compact_key);
+    if let Some(compact_entry) = compact_result {
+        set_or_extend_ttl(env, &compact_key, RecordType::Escrow);
+        let dispute = get_escrow_dispute_config(env, commitment);
+        return Some(compact_entry.into_public(env, dispute));
+    }
+
+    let legacy_key = legacy_escrow_key(commitment);
+    let legacy_result: Option<EscrowEntry> = env.storage().persistent().get(&legacy_key);
+    if legacy_result.is_some() {
+        set_or_extend_ttl(env, &legacy_key, RecordType::Escrow);
+    }
+    legacy_result
 }
 
 /// Check if an escrow entry exists in storage.
 #[allow(dead_code)]
 pub fn has_escrow(env: &Env, commitment: &Bytes) -> bool {
-    let key = DataKey::Escrow(commitment.clone());
-    env.storage().persistent().has(&key)
+    env.storage()
+        .persistent()
+        .has(&compact_escrow_key(commitment))
+        || env
+            .storage()
+            .persistent()
+            .has(&legacy_escrow_key(commitment))
+}
+
+/// Migrate a legacy `DataKey::Escrow(commitment)` record to the compact v1
+/// schema (`DataKey::EscrowCore` + optional `DataKey::EscrowDispute`).
+///
+/// Idempotent: returns `true` when a legacy record was transformed, or `false`
+/// if the record was already migrated or does not exist.
+pub fn migrate_legacy_escrow_record(env: &Env, commitment: &Bytes) -> bool {
+    let legacy_key = legacy_escrow_key(commitment);
+    let legacy_entry: Option<EscrowEntry> = env.storage().persistent().get(&legacy_key);
+    if let Some(entry) = legacy_entry {
+        put_escrow(env, commitment, &entry);
+        return true;
+    }
+    false
+}
+
+/// Extend the TTL of whichever escrow representation is currently stored.
+pub fn extend_escrow_storage_ttl(env: &Env, commitment: &Bytes) -> bool {
+    extend_escrow_compaction_ttl(env, commitment)
+}
+
+#[cfg(test)]
+pub(crate) fn legacy_escrow_storage_footprint_bytes(
+    env: &Env,
+    commitment: &Bytes,
+    entry: &EscrowEntry,
+) -> usize {
+    (legacy_escrow_key(commitment).to_xdr(env).len() + entry.to_xdr(env).len()) as usize
+}
+
+#[cfg(test)]
+pub(crate) fn compact_escrow_storage_footprint_bytes(
+    env: &Env,
+    commitment: &Bytes,
+    entry: &EscrowEntry,
+) -> usize {
+    let compact_key = compact_escrow_key(commitment);
+    let compact_entry = CompactEscrowEntry::from_public(entry);
+    let mut total = compact_key.to_xdr(env).len() + compact_entry.to_xdr(env).len();
+
+    let dispute = EscrowDisputeConfig::from_public(env, entry);
+    if !dispute.is_empty() {
+        total += escrow_dispute_key(commitment).to_xdr(env).len() + dispute.to_xdr(env).len();
+    }
+
+    total as usize
 }
 
 /// Get the next escrow counter value.
@@ -125,6 +761,61 @@ pub fn increment_escrow_counter(env: &Env) -> u64 {
     count
 }
 
+pub fn get_contract_version(env: &Env) -> Option<u32> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ContractVersion)
+        .or_else(|| env.storage().persistent().get(&DataKey::SchemaVersion))
+}
+
+pub fn set_contract_version(env: &Env, version: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::ContractVersion, &version);
+    env.storage()
+        .persistent()
+        .set(&DataKey::SchemaVersion, &version);
+}
+
+pub fn get_schema_version(env: &Env) -> Option<u32> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SchemaVersion)
+        .or_else(|| env.storage().persistent().get(&DataKey::ContractVersion))
+}
+
+pub fn set_schema_version(env: &Env, version: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::SchemaVersion, &version);
+    env.storage()
+        .persistent()
+        .set(&DataKey::ContractVersion, &version);
+}
+
+/// Returns true only after a successful one-time contract initialization.
+pub fn is_initialized(env: &Env) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Initialized)
+        .unwrap_or(false)
+}
+
+/// Mark contract as initialized.
+pub fn set_initialized(env: &Env, initialized: bool) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::Initialized, &initialized);
+}
+
+pub fn get_wasm_hash(env: &Env) -> Option<BytesN<32>> {
+    env.storage().persistent().get(&DataKey::WasmHash)
+}
+
+pub fn set_wasm_hash(env: &Env, hash: &BytesN<32>) {
+    env.storage().persistent().set(&DataKey::WasmHash, hash);
+}
+
 // -----------------------------------------------------------------------------
 // Admin helpers
 // -----------------------------------------------------------------------------
@@ -143,11 +834,173 @@ pub fn get_admin(env: &Env) -> Option<Address> {
     env.storage().persistent().get(&key)
 }
 
+pub fn set_admin_signers(env: &Env, signers: &Vec<Address>) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::AdminSigners, signers);
+}
+
+pub fn get_admin_signers(env: &Env) -> Option<Vec<Address>> {
+    env.storage().persistent().get(&DataKey::AdminSigners)
+}
+
+pub fn set_admin_threshold(env: &Env, threshold: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::AdminThreshold, &threshold);
+}
+
+pub fn get_admin_threshold(env: &Env) -> Option<u32> {
+    env.storage().persistent().get(&DataKey::AdminThreshold)
+}
+
+pub fn get_admin_approval_round(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AdminApprovalRound)
+        .unwrap_or(0)
+}
+
+pub fn set_admin_approval_round(env: &Env, round: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::AdminApprovalRound, &round);
+}
+
+pub fn get_admin_approval_count(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AdminApprovalCount)
+        .unwrap_or(0)
+}
+
+pub fn set_admin_approval_count(env: &Env, count: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::AdminApprovalCount, &count);
+}
+
+pub fn is_admin_approval_ready(env: &Env) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AdminApprovalReady)
+        .unwrap_or(false)
+}
+
+pub fn set_admin_approval_ready(env: &Env, ready: bool) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::AdminApprovalReady, &ready);
+}
+
+pub fn get_signer_approval_round(env: &Env, signer: &Address) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AdminSignerApprovalRound(signer.clone()))
+        .unwrap_or(u32::MAX)
+}
+
+pub fn set_signer_approval_round(env: &Env, signer: &Address, round: u32) {
+    env.storage().persistent().set(
+        &DataKey::AdminSignerApprovalRound(signer.clone()),
+        &round,
+    );
+}
+
+// -----------------------------------------------------------------------------
+// TTL Helper
+// -----------------------------------------------------------------------------
+
+/// Set or extend TTL for a storage key based on record type policy.
+pub fn set_or_extend_ttl(env: &Env, key: &DataKey, record_type: RecordType) {
+    let policy = get_ttl_policy(record_type);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, policy.threshold, policy.ttl);
+}
+
 /// Set paused state.
 #[allow(dead_code)]
-pub fn set_paused(env: &Env, paused: bool) {
+pub fn set_paused(env: &Env, paused: bool, reason: u32) {
     let key = DataKey::Paused;
     env.storage().persistent().set(&key, &paused);
+
+    let reason_key = DataKey::GlobalPauseReason;
+    if paused {
+        env.storage().persistent().set(&reason_key, &reason);
+    } else {
+        env.storage().persistent().set(&reason_key, &0u32);
+    }
+}
+
+/// Get global pause reason code.
+pub fn get_global_pause_reason(env: &Env) -> u32 {
+    let key = DataKey::GlobalPauseReason;
+    env.storage().persistent().get(&key).unwrap_or(0u32)
+}
+
+/// Set pause flags (granular pause control – caller already verified by admin module).
+pub fn set_pause_flags(
+    env: &Env,
+    _caller: &Address,
+    flags_to_enable: u64,
+    flags_to_disable: u64,
+    reason: u32,
+) {
+    let key = DataKey::PauseFlags;
+    let current: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+    let updated = (current | flags_to_enable) & !flags_to_disable;
+    env.storage().persistent().set(&key, &updated);
+
+    let reasons_key = DataKey::FeaturePauseReasons;
+    let mut reasons: Map<u32, u32> = env
+        .storage()
+        .persistent()
+        .get(&reasons_key)
+        .unwrap_or_else(|| Map::new(env));
+
+    let flags = [1u32, 2u32, 4u32, 8u32, 16u32, 32u32];
+    for &f in &flags {
+        let u64_f = f as u64;
+        if (flags_to_enable & u64_f) != 0 {
+            reasons.set(f, reason);
+        }
+        if (flags_to_disable & u64_f) != 0 {
+            reasons.remove(f);
+        }
+    }
+    env.storage().persistent().set(&reasons_key, &reasons);
+}
+
+/// Read the current granular pause flag bitmask.
+pub fn get_pause_flags(env: &Env) -> u64 {
+    let key = DataKey::PauseFlags;
+    env.storage().persistent().get(&key).unwrap_or(0)
+}
+
+/// Check whether a specific operation flag is paused.
+pub fn is_feature_paused(env: &Env, flag: PauseFlag) -> bool {
+    get_pause_flags(env) & (flag as u64) != 0
+}
+
+/// Get the reason a specific feature was paused.
+pub fn get_feature_pause_reason(env: &Env, flag: PauseFlag) -> u32 {
+    let key = DataKey::FeaturePauseReasons;
+    let reasons: Map<u32, u32> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Map::new(env));
+    reasons.get(flag as u32).unwrap_or(0u32)
+}
+
+/// Get the current pause status including global and per-feature pauses.
+pub fn get_pause_status(env: &Env) -> crate::types::PauseStatus {
+    crate::types::PauseStatus {
+        is_globally_paused: is_paused(env),
+        global_pause_reason: get_global_pause_reason(env),
+        feature_pause_flags: get_pause_flags(env),
+    }
 }
 
 /// Get paused state.
@@ -197,4 +1050,352 @@ pub fn get_privacy_history(env: &Env, account: &Address) -> Vec<u32> {
         .persistent()
         .get(&key)
         .unwrap_or(Vec::new(env))
+}
+
+// -----------------------------------------------------------------------------
+// Fee & Wallet helpers
+// -----------------------------------------------------------------------------
+
+pub fn get_fee_config(env: &Env) -> FeeConfig {
+    let key = DataKey::FeeConfig;
+    let result = env.storage().persistent().get(&key);
+    if result.is_some() {
+        set_or_extend_ttl(env, &key, RecordType::FeeConfig);
+    }
+    result.unwrap_or(FeeConfig { fee_bps: 0 })
+}
+
+pub fn set_fee_config(env: &Env, config: &FeeConfig) {
+    let key = DataKey::FeeConfig;
+    env.storage().persistent().set(&key, config);
+    set_or_extend_ttl(env, &key, RecordType::FeeConfig);
+}
+
+pub fn get_ttl_extension_fee_config(env: &Env) -> TtlExtensionFeeConfig {
+    let key = DataKey::TtlExtensionFeeConfig;
+    let result = env.storage().persistent().get(&key);
+    if result.is_some() {
+        set_or_extend_ttl(env, &key, RecordType::FeeConfig);
+    }
+    result.unwrap_or(TtlExtensionFeeConfig {
+        fee_per_second: 0,
+        min_fee: 0,
+        max_fee: 0,
+    })
+}
+
+pub fn set_ttl_extension_fee_config(env: &Env, config: &TtlExtensionFeeConfig) {
+    let key = DataKey::TtlExtensionFeeConfig;
+    env.storage().persistent().set(&key, config);
+    set_or_extend_ttl(env, &key, RecordType::FeeConfig);
+}
+
+pub fn get_platform_wallet(env: &Env) -> Option<Address> {
+    env.storage().persistent().get(&DataKey::PlatformWallet)
+}
+
+pub fn set_platform_wallet(env: &Env, wallet: &Address) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::PlatformWallet, wallet);
+}
+
+pub fn get_oracle_fee_config(env: &Env) -> Option<crate::types::OracleFeeConfig> {
+    env.storage().persistent().get(&DataKey::OracleFeeConfig)
+}
+
+pub fn set_oracle_fee_config(env: &Env, config: &crate::types::OracleFeeConfig) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::OracleFeeConfig, config);
+}
+
+/// Get the cached oracle price record (price + timestamp).
+pub fn get_cached_oracle_price(env: &Env) -> Option<CachedOraclePrice> {
+    env.storage().persistent().get(&DataKey::CachedOraclePrice)
+}
+
+/// Set the cached oracle price record. Called when the oracle delivers a fresh price.
+pub fn set_cached_oracle_price(env: &Env, price: &CachedOraclePrice) {
+    let key = DataKey::CachedOraclePrice;
+    env.storage().persistent().set(&key, price);
+    set_or_extend_ttl(env, &key, RecordType::FeeConfig);
+}
+
+pub fn is_hook_allowed(env: &Env, hook_contract: &Address) -> bool {
+    let key = DataKey::HookAllowlist(hook_contract.clone());
+    env.storage().persistent().get(&key).unwrap_or(false)
+}
+
+pub fn set_hook_allowed(env: &Env, hook_contract: &Address, allowed: bool) {
+    let key = DataKey::HookAllowlist(hook_contract.clone());
+    if allowed {
+        env.storage().persistent().set(&key, &true);
+    } else {
+        env.storage().persistent().remove(&key);
+    }
+}
+
+pub fn get_registered_hooks(env: &Env) -> Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::HookRegistry)
+        .unwrap_or(Vec::new(env))
+}
+
+pub fn set_registered_hooks(env: &Env, hooks: &Vec<Address>) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::HookRegistry, hooks);
+}
+
+pub fn get_reentrancy_guard(env: &Env) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ReentrancyGuard)
+        .unwrap_or(false)
+}
+
+pub fn set_reentrancy_guard(env: &Env, value: &bool) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::ReentrancyGuard, value);
+}
+
+// -----------------------------------------------------------------------------
+// Stealth helpers
+// -----------------------------------------------------------------------------
+
+pub fn get_stealth_escrow(env: &Env, stealth_address: &BytesN<32>) -> Option<StealthEscrowEntry> {
+    let key = DataKey::StealthEscrow(stealth_address.clone());
+    let result = env.storage().persistent().get(&key);
+    if result.is_some() {
+        set_or_extend_ttl(env, &key, RecordType::StealthEscrow);
+    }
+    result
+}
+
+pub fn put_stealth_escrow(env: &Env, stealth_address: &BytesN<32>, entry: &StealthEscrowEntry) {
+    let key = DataKey::StealthEscrow(stealth_address.clone());
+    env.storage().persistent().set(&key, entry);
+    set_or_extend_ttl(env, &key, RecordType::StealthEscrow);
+}
+
+// -----------------------------------------------------------------------------
+// Role helpers
+// -----------------------------------------------------------------------------
+
+pub fn get_roles(env: &Env, address: &Address) -> Vec<Role> {
+    let key = DataKey::UserRole(address.clone());
+    env.storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(Vec::new(env))
+}
+
+pub fn set_roles(env: &Env, address: &Address, roles: &Vec<Role>) {
+    let key = DataKey::UserRole(address.clone());
+    env.storage().persistent().set(&key, roles);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_THRESHOLD, SIX_MONTHS_IN_LEDGERS);
+}
+
+// -----------------------------------------------------------------------------
+// Escrow-id map helpers (Issue #304)
+// -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// Fee Router v2 helpers (Issue #305)
+// -----------------------------------------------------------------------------
+
+/// Get per-asset fee config for `token`.
+pub fn get_per_asset_fee(env: &Env, token: &Address) -> Option<crate::types::PerAssetFeeConfig> {
+    let key = DataKey::PerAssetFee(token.clone());
+    env.storage().persistent().get(&key)
+}
+
+/// Set per-asset fee config for `token`.
+pub fn set_per_asset_fee(env: &Env, token: &Address, config: &crate::types::PerAssetFeeConfig) {
+    let key = DataKey::PerAssetFee(token.clone());
+    env.storage().persistent().set(&key, config);
+}
+
+/// Get current fee collector rotation index (default 0).
+pub fn get_fee_collector_index(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::FeeCollectorIndex)
+        .unwrap_or(0)
+}
+
+/// Set current fee collector rotation index.
+pub fn set_fee_collector_index(env: &Env, index: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::FeeCollectorIndex, &index);
+}
+
+/// Get fee collector address at a specific rotation index.
+pub fn get_fee_collector_at(env: &Env, index: u32) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::FeeCollector(index))
+}
+
+/// Set fee collector address at a specific rotation index.
+pub fn set_fee_collector_at(env: &Env, index: u32, collector: &Address) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::FeeCollector(index), collector);
+}
+
+/// Get the timestamp of the last fee collector rotation (for cooldown enforcement).
+pub fn get_fee_collector_last_rotation(env: &Env) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::FeeCollectorLastRotation)
+        .unwrap_or(0u64)
+}
+
+/// Set the timestamp of the last fee collector rotation.
+pub fn set_fee_collector_last_rotation(env: &Env, timestamp: u64) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::FeeCollectorLastRotation, &timestamp);
+}
+
+/// Get the rotation history (all rotations that have occurred).
+pub fn get_fee_collector_rotation_history(
+    env: &Env,
+) -> Vec<crate::types::FeeCollectorRotationEntry> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::FeeCollectorRotationHistory)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Add a rotation entry to the history.
+pub fn add_fee_collector_rotation_entry(
+    env: &Env,
+    entry: &crate::types::FeeCollectorRotationEntry,
+) {
+    let mut history = get_fee_collector_rotation_history(env);
+    history.push_back(entry.clone());
+    env.storage()
+        .persistent()
+        .set(&DataKey::FeeCollectorRotationHistory, &history);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cooldown enforcement constant
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Minimum seconds between fee collector rotations (24 hours).
+pub const FEE_COLLECTOR_ROTATION_COOLDOWN_SECS: u64 = 86400;
+
+// -----------------------------------------------------------------------------
+// Escrow-id map helpers (Issue #304)
+// -----------------------------------------------------------------------------
+
+/// Look up the 32-byte commitment associated with a deterministic `escrow_id`.
+pub fn get_escrow_id_mapping(env: &Env, escrow_id: &BytesN<32>) -> Option<BytesN<32>> {
+    let key = DataKey::EscrowIdMap(escrow_id.clone());
+    let result = env.storage().persistent().get(&key);
+    if result.is_some() {
+        set_or_extend_ttl(env, &key, RecordType::EscrowIdMap);
+    }
+    result
+}
+
+/// Record the mapping `escrow_id → commitment` so future identical creates
+/// can be recognized and deduplicated.
+pub fn put_escrow_id_mapping(env: &Env, escrow_id: &BytesN<32>, commitment: &BytesN<32>) {
+    let key = DataKey::EscrowIdMap(escrow_id.clone());
+    env.storage().persistent().set(&key, commitment);
+    set_or_extend_ttl(env, &key, RecordType::EscrowIdMap);
+}
+
+// -----------------------------------------------------------------------------
+// Dispute vote helpers
+// -----------------------------------------------------------------------------
+
+/// Store an arbiter's vote for a disputed escrow.
+pub fn put_dispute_vote(env: &Env, commitment: &Bytes, arbiter: &Address, vote: &DisputeVote) {
+    let key = DataKey::DisputeVote(commitment.clone(), arbiter.clone());
+    env.storage().persistent().set(&key, vote);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_THRESHOLD, SIX_MONTHS_IN_LEDGERS);
+}
+
+/// Get an arbiter's vote for a disputed escrow.
+pub fn get_dispute_vote(env: &Env, commitment: &Bytes, arbiter: &Address) -> Option<DisputeVote> {
+    let key = DataKey::DisputeVote(commitment.clone(), arbiter.clone());
+    env.storage().persistent().get(&key)
+}
+
+/// Check if an arbiter has already voted on a dispute.
+pub fn has_dispute_vote(env: &Env, commitment: &Bytes, arbiter: &Address) -> bool {
+    let key = DataKey::DisputeVote(commitment.clone(), arbiter.clone());
+    env.storage().persistent().has(&key)
+}
+
+/// Count the number of votes for a disputed escrow.
+pub fn count_dispute_votes(env: &Env, commitment: &Bytes, arbiters: &Vec<Address>) -> u32 {
+    let mut count = 0;
+    for arbiter in arbiters.iter() {
+        if has_dispute_vote(env, commitment, &arbiter) {
+            count += 1;
+        }
+    }
+    count
+}
+
+// ---- Escrow extension helpers (Issue #113) ----
+
+/// Get an escrow's extension record if it exists.
+pub fn get_escrow_extension(env: &Env, commitment: &Bytes) -> Option<crate::types::EscrowExtension> {
+    let key = DataKey::EscrowExtension(commitment.clone());
+    env.storage().persistent().get(&key)
+}
+
+/// Store or update an escrow's extension record.
+pub fn put_escrow_extension(
+    env: &Env,
+    commitment: &Bytes,
+    extension: &crate::types::EscrowExtension,
+) {
+    let key = DataKey::EscrowExtension(commitment.clone());
+    env.storage().persistent().set(&key, extension);
+    set_or_extend_ttl(env, &key, RecordType::EscrowDispute);
+}
+
+// ---- Dispute evidence helpers (Issue #115) ----
+
+/// Get dispute evidence for a given commitment and evidence hash.
+pub fn get_dispute_evidence(
+    env: &Env,
+    commitment: &Bytes,
+    evidence_hash: &BytesN<32>,
+) -> Option<crate::types::DisputeEvidence> {
+    let key = DataKey::DisputeEvidence(commitment.clone(), evidence_hash.clone());
+    env.storage().persistent().get(&key)
+}
+
+/// Store dispute evidence.
+pub fn put_dispute_evidence(
+    env: &Env,
+    commitment: &Bytes,
+    evidence: &crate::types::DisputeEvidence,
+) {
+    let key = DataKey::DisputeEvidence(commitment.clone(), evidence.evidence_hash.clone());
+    env.storage().persistent().set(&key, evidence);
+    set_or_extend_ttl(env, &key, RecordType::EscrowDispute);
+}
+
+/// Check if evidence exists for an escrow.
+pub fn has_dispute_evidence(env: &Env, commitment: &Bytes, evidence_hash: &BytesN<32>) -> bool {
+    let key = DataKey::DisputeEvidence(commitment.clone(), evidence_hash.clone());
+    env.storage().persistent().has(&key)
 }

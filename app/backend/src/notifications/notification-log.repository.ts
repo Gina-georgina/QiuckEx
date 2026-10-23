@@ -4,6 +4,7 @@ import {
   NotificationChannel,
   NotificationEventType,
 } from "./types/notification.types";
+import { WEBHOOK_MAX_DELIVERY_ATTEMPTS } from "./webhook-retry.constants";
 
 @Injectable()
 export class NotificationLogRepository {
@@ -11,17 +12,27 @@ export class NotificationLogRepository {
 
   constructor(private readonly supabase: SupabaseService) {}
 
-  /**
-   * Create a pending log entry.
-   * Uses ON CONFLICT DO NOTHING so duplicate events don't create extra rows.
-   * Returns the existing or newly created row id.
-   */
   async createPending(
     publicKey: string,
     channel: NotificationChannel,
     eventType: NotificationEventType,
     eventId: string,
+    templateVersionId?: string,
+    previewScope?: string,
   ): Promise<string | null> {
+    const insertData: Record<string, unknown> = {
+      public_key: publicKey,
+      channel,
+      event_type: eventType,
+      event_id: eventId,
+      status: "pending",
+      attempts: 0,
+    };
+
+    if (previewScope) {
+      insertData.preview_scope = previewScope;
+    }
+
     const { data, error } = await this.supabase
       .getClient()
       .from("notification_log")
@@ -33,6 +44,7 @@ export class NotificationLogRepository {
           event_id: eventId,
           status: "pending",
           attempts: 0,
+          template_version_id: templateVersionId ?? null,
         },
         {
           onConflict: "public_key,channel,event_id,event_type",
@@ -50,22 +62,31 @@ export class NotificationLogRepository {
     return data?.id ?? null;
   }
 
-  /** Mark a delivery as sent. */
   async markSent(
     publicKey: string,
     channel: NotificationChannel,
     eventType: NotificationEventType,
     eventId: string,
     providerMessageId?: string,
+    httpStatus?: number,
+    responseBody?: string,
   ): Promise<void> {
+    const updateData: Record<string, unknown> = {
+      status: "sent",
+      provider_message_id: providerMessageId ?? null,
+      last_error: null,
+    };
+
+    if (channel === "webhook") {
+      updateData.webhook_response_status = httpStatus ?? null;
+      updateData.webhook_response_body = responseBody ?? null;
+      updateData.webhook_delivered_at = new Date().toISOString();
+    }
+
     const { error } = await this.supabase
       .getClient()
       .from("notification_log")
-      .update({
-        status: "sent",
-        provider_message_id: providerMessageId ?? null,
-        last_error: null,
-      })
+      .update(updateData)
       .eq("public_key", publicKey)
       .eq("channel", channel)
       .eq("event_type", eventType)
@@ -76,7 +97,6 @@ export class NotificationLogRepository {
     }
   }
 
-  /** Mark a delivery as failed, recording the error and incrementing attempts. */
   async markFailed(
     publicKey: string,
     channel: NotificationChannel,
@@ -84,10 +104,8 @@ export class NotificationLogRepository {
     eventId: string,
     errorMessage: string,
   ): Promise<void> {
-    // Increment attempts via RPC or read-modify-write (simple approach)
     const client = this.supabase.getClient();
 
-    // Read current attempt count
     const { data } = await client
       .from("notification_log")
       .select("attempts")
@@ -98,10 +116,16 @@ export class NotificationLogRepository {
       .maybeSingle();
 
     const attempts = (data?.attempts ?? 0) + 1;
+    const exhausted =
+      channel === "webhook" && attempts >= WEBHOOK_MAX_DELIVERY_ATTEMPTS;
 
     const { error } = await client
       .from("notification_log")
-      .update({ status: "failed", last_error: errorMessage, attempts })
+      .update({
+        status: exhausted ? "dlq" : "failed",
+        last_error: errorMessage,
+        attempts,
+      })
       .eq("public_key", publicKey)
       .eq("channel", channel)
       .eq("event_type", eventType)
@@ -112,20 +136,193 @@ export class NotificationLogRepository {
     }
   }
 
-  /** Return failed entries eligible for retry (status=failed, attempts < maxAttempts). */
+  async getDelivery(
+    publicKey: string,
+    channel: NotificationChannel,
+    eventType: string,
+    eventId: string,
+  ): Promise<{
+    id: string;
+    channel: NotificationChannel;
+    eventType: NotificationEventType;
+    eventId: string;
+    status: string;
+    attempts: number;
+    lastError?: string;
+    httpStatus?: number;
+    responseBody?: string;
+    createdAt: string;
+    updatedAt: string;
+    deliveredAt?: string;
+  } | null> {
+    const { data, error } = await this.supabase
+      .getClient()
+      .from("notification_log")
+      .select(
+        "id, channel, event_type, event_id, status, attempts, last_error, webhook_response_status, webhook_response_body, created_at, updated_at, webhook_delivered_at",
+      )
+      .eq("public_key", publicKey)
+      .eq("channel", channel)
+      .eq("event_type", eventType)
+      .eq("event_id", eventId)
+      .maybeSingle();
+
+    if (error) {
+      this.logger.error(
+        `Failed to fetch ${channel} delivery ${eventType}/${eventId}: ${error.message}`,
+      );
+      return null;
+    }
+
+    if (!data) return null;
+
+    return {
+      id: data.id,
+      channel: data.channel as NotificationChannel,
+      eventType: data.event_type as NotificationEventType,
+      eventId: data.event_id,
+      status: data.status,
+      attempts: data.attempts,
+      lastError: data.last_error ?? undefined,
+      httpStatus: data.webhook_response_status ?? undefined,
+      responseBody: data.webhook_response_body ?? undefined,
+      createdAt: data.created_at,
+      updatedAt: data.updated_at,
+      deliveredAt: data.webhook_delivered_at ?? undefined,
+    };
+  }
+
+  /**
+   * Reset a non-webhook delivery for a safe operator replay. The row is
+   * preserved (not deleted) so the audit trail and attempt history survive.
+   */
+  async resetNotificationForManualReplay(
+    publicKey: string,
+    channel: NotificationChannel,
+    eventType: NotificationEventType,
+    eventId: string,
+  ): Promise<void> {
+    const { error } = await this.supabase
+      .getClient()
+      .from("notification_log")
+      .update({
+        status: "pending",
+        attempts: 0,
+        last_error: null,
+      })
+      .eq("public_key", publicKey)
+      .eq("channel", channel)
+      .eq("event_type", eventType)
+      .eq("event_id", eventId);
+
+    if (error) {
+      this.logger.warn(
+        `Failed to reset ${channel} delivery for manual replay: ${error.message}`,
+      );
+    }
+  }
+
+  async getWebhookDelivery(
+    publicKey: string,
+    eventType: string,
+    eventId: string,
+  ): Promise<{
+    id: string;
+    eventType: NotificationEventType;
+    eventId: string;
+    status: string;
+    attempts: number;
+    lastError?: string;
+    httpStatus?: number;
+    responseBody?: string;
+    createdAt: string;
+    updatedAt: string;
+    deliveredAt?: string;
+  } | null> {
+    const { data, error } = await this.supabase
+      .getClient()
+      .from("notification_log")
+      .select(
+        "id, event_type, event_id, status, attempts, last_error, webhook_response_status, webhook_response_body, created_at, updated_at, webhook_delivered_at",
+      )
+      .eq("public_key", publicKey)
+      .eq("channel", "webhook")
+      .eq("event_type", eventType)
+      .eq("event_id", eventId)
+      .maybeSingle();
+
+    if (error) {
+      this.logger.error(
+        `Failed to fetch webhook delivery ${eventType}/${eventId}: ${error.message}`,
+      );
+      return null;
+    }
+
+    if (!data) return null;
+
+    return {
+      id: data.id,
+      eventType: data.event_type as NotificationEventType,
+      eventId: data.event_id,
+      status: data.status,
+      attempts: data.attempts,
+      lastError: data.last_error ?? undefined,
+      httpStatus: data.webhook_response_status ?? undefined,
+      responseBody: data.webhook_response_body ?? undefined,
+      createdAt: data.created_at,
+      updatedAt: data.updated_at,
+      deliveredAt: data.webhook_delivered_at ?? undefined,
+    };
+  }
+
+  /** Reset a delivery for a safe manual replay (preserves row for audit). */
+  async resetForManualReplay(
+    publicKey: string,
+    eventType: NotificationEventType,
+    eventId: string,
+  ): Promise<void> {
+    const { error } = await this.supabase
+      .getClient()
+      .from("notification_log")
+      .update({
+        status: "pending",
+        attempts: 0,
+        last_error: null,
+      })
+      .eq("public_key", publicKey)
+      .eq("channel", "webhook")
+      .eq("event_type", eventType)
+      .eq("event_id", eventId);
+
+    if (error) {
+      this.logger.warn(
+        `Failed to reset delivery for manual replay: ${error.message}`,
+      );
+    }
+  }
+
   async getPendingRetries(maxAttempts: number): Promise<
     Array<{
+      id: string;
       publicKey: string;
       channel: NotificationChannel;
       eventType: NotificationEventType;
       eventId: string;
       attempts: number;
+      lastFailedAt?: string;
+      /**
+       * Position of this delivery in creation order across the pending set
+       * (issue #276). Used to hold a later event back until every earlier
+       * unfinished event for the same resource has succeeded or been
+       * quarantined.
+       */
+      sequence: number;
     }>
   > {
     const { data, error } = await this.supabase
       .getClient()
       .from("notification_log")
-      .select("public_key, channel, event_type, event_id, attempts")
+      .select("id, public_key, channel, event_type, event_id, attempts, updated_at, created_at")
       .eq("status", "failed")
       .lt("attempts", maxAttempts)
       .order("created_at", { ascending: true })
@@ -136,16 +333,71 @@ export class NotificationLogRepository {
       return [];
     }
 
-    return (data ?? []).map((r) => ({
+    return (data ?? []).map((r, index) => ({
+      id: r.id,
       publicKey: r.public_key,
       channel: r.channel as NotificationChannel,
       eventType: r.event_type as NotificationEventType,
       eventId: r.event_id,
       attempts: r.attempts,
+      lastFailedAt: r.updated_at ?? undefined,
+      // Rows are ordered oldest-first, so the index is a stable per-resource
+      // ordering key that needs no additional column or sequence generator.
+      sequence: index + 1,
     }));
   }
 
-  /** Check if an event was already successfully delivered via a channel (idempotency check). */
+  /**
+   * Move a delivery to the dead-letter state with a stable quarantine reason
+   * (issue #276).
+   *
+   * Quarantine is terminal for automatic retries: the row stops being returned
+   * by `getPendingRetries`, so the scheduler stops attempting it. Recovery is an
+   * explicit operator replay via `resetForManualReplay`.
+   */
+  async quarantine(
+    id: string,
+    reason: string,
+    lastError?: string,
+  ): Promise<void> {
+    const { error } = await this.supabase
+      .getClient()
+      .from("notification_log")
+      .update({
+        status: "dlq",
+        last_error: lastError ?? reason,
+        dlq_reason: reason,
+        quarantined_at: new Date().toISOString(),
+      })
+      .eq("id", id);
+
+    if (error) {
+      this.logger.warn(`Failed to quarantine delivery ${id}: ${error.message}`);
+    }
+  }
+
+  /** Move a log entry to DLQ status after exhausting all retries. */
+  async markDlq(
+    publicKey: string,
+    channel: NotificationChannel,
+    eventType: NotificationEventType,
+    eventId: string,
+    lastError: string,
+  ): Promise<void> {
+    const { error } = await this.supabase
+      .getClient()
+      .from("notification_log")
+      .update({ status: "dlq", last_error: lastError })
+      .eq("public_key", publicKey)
+      .eq("channel", channel)
+      .eq("event_type", eventType)
+      .eq("event_id", eventId);
+
+    if (error) {
+      this.logger.warn(`Failed to mark notification as DLQ: ${error.message}`);
+    }
+  }
+
   async isAlreadySent(
     publicKey: string,
     channel: NotificationChannel,
@@ -164,5 +416,297 @@ export class NotificationLogRepository {
       .maybeSingle();
 
     return !!data;
+  }
+
+  async getWebhookDeliveryLogs(
+    publicKey: string,
+    limit = 50,
+  ): Promise<
+    Array<{
+      id: string;
+      eventType: NotificationEventType;
+      eventId: string;
+      status: string;
+      attempts: number;
+      lastError?: string;
+      httpStatus?: number;
+      responseBody?: string;
+      createdAt: string;
+      deliveredAt?: string;
+    }>
+  > {
+    const { data, error } = await this.supabase
+      .getClient()
+      .from("notification_log")
+      .select(
+        "id, event_type, event_id, status, attempts, last_error, webhook_response_status, webhook_response_body, created_at, webhook_delivered_at",
+      )
+      .eq("public_key", publicKey)
+      .eq("channel", "webhook")
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      this.logger.error(
+        `Failed to fetch webhook logs for ${publicKey}: ${error.message}`,
+      );
+      return [];
+    }
+
+    return (data ?? []).map((r) => ({
+      id: r.id,
+      eventType: r.event_type as NotificationEventType,
+      eventId: r.event_id,
+      status: r.status,
+      attempts: r.attempts,
+      lastError: r.last_error ?? undefined,
+      httpStatus: r.webhook_response_status ?? undefined,
+      responseBody: r.webhook_response_body ?? undefined,
+      createdAt: r.created_at,
+      deliveredAt: r.webhook_delivered_at ?? undefined,
+    }));
+  }
+
+  /** Cursor-paginated variant of getWebhookDeliveryLogs. */
+  async getWebhookDeliveryLogsPaginated(
+    publicKey: string,
+    limit = 50,
+    cursor?: string,
+  ): Promise<{
+    data: Array<{
+      id: string;
+      eventType: NotificationEventType;
+      eventId: string;
+      status: string;
+      attempts: number;
+      lastError?: string;
+      httpStatus?: number;
+      responseBody?: string;
+      createdAt: string;
+      deliveredAt?: string;
+    }>;
+    next_cursor: string | null;
+    has_more: boolean;
+  }> {
+    const effectiveLimit = Math.min(100, Math.max(1, limit));
+
+    let query = this.supabase
+      .getClient()
+      .from("notification_log")
+      .select(
+        "id, event_type, event_id, status, attempts, last_error, webhook_response_status, webhook_response_body, created_at, webhook_delivered_at",
+      )
+      .eq("public_key", publicKey)
+      .eq("channel", "webhook");
+
+    // Decode cursor
+    if (cursor) {
+      try {
+        const json = Buffer.from(cursor, "base64url").toString("utf-8");
+        const parsed = JSON.parse(json);
+        if (typeof parsed.pk === "string" && typeof parsed.id === "string") {
+          query = query
+            .lt("created_at", parsed.pk)
+            .or(`created_at.eq.${parsed.pk},id.lt.${parsed.id}`);
+        }
+      } catch {
+        // invalid cursor
+      }
+    }
+
+    query = query
+      .order("created_at", { ascending: false })
+      .order("id", { ascending: false })
+      .limit(effectiveLimit + 1);
+
+    const { data, error } = await query;
+
+    if (error) {
+      this.logger.error(
+        `Failed to fetch webhook logs for ${publicKey}: ${error.message}`,
+      );
+      return { data: [], next_cursor: null, has_more: false };
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rawRows = (data ?? []) as any[];
+    const hasMore = rawRows.length > effectiveLimit;
+    const pageRows = hasMore ? rawRows.slice(0, effectiveLimit) : rawRows;
+
+    const mapped = pageRows.map((r) => ({
+      id: r.id,
+      eventType: r.event_type as NotificationEventType,
+      eventId: r.event_id,
+      status: r.status,
+      attempts: r.attempts,
+      lastError: r.last_error ?? undefined,
+      httpStatus: r.webhook_response_status ?? undefined,
+      responseBody: r.webhook_response_body ?? undefined,
+      createdAt: r.created_at,
+      deliveredAt: r.webhook_delivered_at ?? undefined,
+    }));
+
+    let nextCursor: string | null = null;
+    if (hasMore && pageRows.length > 0) {
+      const last = pageRows[pageRows.length - 1];
+      nextCursor = Buffer.from(
+        JSON.stringify({ pk: last.created_at, id: last.id }),
+        "utf-8",
+      ).toString("base64url");
+    }
+
+    return { data: mapped, next_cursor: nextCursor, has_more: hasMore };
+  }
+
+  /** Get webhook stats for a specific public key. */
+  async getWebhookStats(publicKey: string): Promise<{
+    totalSent: number;
+    totalFailed: number;
+    pendingRetries: number;
+    lastDeliveryAt?: string;
+    lastError?: string;
+  }> {
+    const client = this.supabase.getClient();
+
+    // Get counts by status
+    const { data: sentData } = await client
+      .from("notification_log")
+      .select("id", { count: "exact", head: true })
+      .eq("public_key", publicKey)
+      .eq("channel", "webhook")
+      .eq("status", "sent");
+
+    const { data: failedData } = await client
+      .from("notification_log")
+      .select("id", { count: "exact", head: true })
+      .eq("public_key", publicKey)
+      .eq("channel", "webhook")
+      .eq("status", "failed");
+
+    const pendingRetries = await this.getPendingRetries(3);
+    const pendingForUser = pendingRetries.filter(
+      (r) => r.publicKey === publicKey && r.channel === "webhook",
+    );
+
+    const { data: lastDelivery } = await client
+      .from("notification_log")
+      .select("webhook_delivered_at, last_error")
+      .eq("public_key", publicKey)
+      .eq("channel", "webhook")
+      .eq("status", "sent")
+      .order("webhook_delivered_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    return {
+      totalSent: sentData?.length ?? 0,
+      totalFailed: failedData?.length ?? 0,
+      pendingRetries: pendingForUser.length,
+      lastDeliveryAt: lastDelivery?.webhook_delivered_at ?? undefined,
+      lastError: lastDelivery?.last_error ?? undefined,
+    };
+  }
+
+  /** List webhook deliveries that exhausted all retry attempts (DLQ). */
+  async getWebhookDlqEntries(
+    publicKey: string,
+    limit = 50,
+  ): Promise<
+    Array<{
+      id: string;
+      eventType: NotificationEventType;
+      eventId: string;
+      attempts: number;
+      lastError?: string;
+      httpStatus?: number;
+      responseBody?: string;
+      createdAt: string;
+      updatedAt?: string;
+    }>
+  > {
+    const effectiveLimit = Math.min(100, Math.max(1, limit));
+
+    const { data, error } = await this.supabase
+      .getClient()
+      .from("notification_log")
+      .select(
+        "id, event_type, event_id, attempts, last_error, webhook_response_status, webhook_response_body, created_at, updated_at",
+      )
+      .eq("public_key", publicKey)
+      .eq("channel", "webhook")
+      .eq("status", "dlq")
+      .order("updated_at", { ascending: false })
+      .limit(effectiveLimit);
+
+    if (error) {
+      this.logger.error(
+        `Failed to fetch webhook DLQ entries for ${publicKey}: ${error.message}`,
+      );
+      return [];
+    }
+
+    return (data ?? []).map((r) => ({
+      id: r.id,
+      eventType: r.event_type as NotificationEventType,
+      eventId: r.event_id,
+      attempts: r.attempts,
+      lastError: r.last_error ?? undefined,
+      httpStatus: r.webhook_response_status ?? undefined,
+      responseBody: r.webhook_response_body ?? undefined,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at ?? undefined,
+    }));
+  }
+
+  /** Count webhook deliveries currently parked in the DLQ for a public key. */
+  async countWebhookDlq(publicKey: string): Promise<number> {
+    const { count, error } = await this.supabase
+      .getClient()
+      .from("notification_log")
+      .select("id", { count: "exact", head: true })
+      .eq("public_key", publicKey)
+      .eq("channel", "webhook")
+      .eq("status", "dlq");
+
+    if (error) {
+      this.logger.error(
+        `Failed to count webhook DLQ for ${publicKey}: ${error.message}`,
+      );
+      return 0;
+    }
+
+    return count ?? 0;
+  }
+
+  /** Delivery totals (sent/failed/dlq) used to derive success-rate metrics. */
+  async getWebhookDeliveryTotals(
+    publicKey: string,
+  ): Promise<{ sent: number; failed: number; dlq: number }> {
+    const client = this.supabase.getClient();
+
+    const count = async (status: string): Promise<number> => {
+      const { count, error } = await client
+        .from("notification_log")
+        .select("id", { count: "exact", head: true })
+        .eq("public_key", publicKey)
+        .eq("channel", "webhook")
+        .eq("status", status);
+
+      if (error) {
+        this.logger.error(
+          `Failed to count webhook ${status} for ${publicKey}: ${error.message}`,
+        );
+        return 0;
+      }
+      return count ?? 0;
+    };
+
+    const [sent, failed, dlq] = await Promise.all([
+      count("sent"),
+      count("failed"),
+      count("dlq"),
+    ]);
+
+    return { sent, failed, dlq };
   }
 }

@@ -5,7 +5,7 @@ import {
   OnModuleDestroy,
 } from "@nestjs/common";
 import { EventEmitter2 } from "@nestjs/event-emitter";
-import { Horizon } from "stellar-sdk";
+import { Horizon } from "@stellar/stellar-sdk";
 
 import { AppConfigService } from "../config";
 import { HORIZON_BASE_URLS } from "../config/stellar.config";
@@ -15,6 +15,9 @@ import {
 } from "./soroban-event.parser";
 import { CursorRepository } from "./cursor.repository";
 import { EscrowEventRepository } from "./escrow-event.repository";
+import { JobQueueService } from "../job-queue/job-queue.service";
+import { JobType } from "../job-queue/types";
+import { StellarReconnectPayload } from "../job-queue/types/job-payloads.types";
 import type {
   EscrowEvent,
   QuickExContractEvent,
@@ -27,6 +30,11 @@ const BACKOFF_MULTIPLIER = 2;
 
 export interface IngestionConfig {
   contractId: string;
+}
+
+export interface DualReadIngestionConfig extends IngestionConfig {
+  previousContractId?: string;
+  effectiveLedger?: number;
 }
 
 /**
@@ -45,9 +53,12 @@ export class StellarIngestionService implements OnModuleInit, OnModuleDestroy {
 
   private server!: Horizon.Server;
   private stopStream: (() => void) | null = null;
+  private stopPreviousStream: (() => void) | null = null;
   private destroyed = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private currentBackoffMs = INITIAL_BACKOFF_MS;
+  private currentContractId: string | null = null;
+  private previousContractId: string | null = null;
 
   constructor(
     private readonly config: AppConfigService,
@@ -55,6 +66,7 @@ export class StellarIngestionService implements OnModuleInit, OnModuleDestroy {
     private readonly escrowRepo: EscrowEventRepository,
     private readonly parser: SorobanEventParser,
     private readonly eventEmitter: EventEmitter2,
+    private readonly jobQueueService: JobQueueService,
   ) {}
 
   onModuleInit(): void {
@@ -69,6 +81,7 @@ export class StellarIngestionService implements OnModuleInit, OnModuleDestroy {
   onModuleDestroy(): void {
     this.destroyed = true;
     this.stopCurrentStream();
+    this.stopPreviousStreamFn();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -81,8 +94,32 @@ export class StellarIngestionService implements OnModuleInit, OnModuleDestroy {
    * Safe to call multiple times; previous stream is closed first.
    */
   async startStreaming(contractId: string): Promise<void> {
+    this.currentContractId = contractId;
     this.stopCurrentStream();
+    this.stopPreviousStreamFn();
     await this.openStream(contractId);
+  }
+
+  /**
+   * Start streaming contract events with dual-read support for transition windows.
+   * Streams from both current and previous contract IDs until effective ledger is reached.
+   */
+  async startStreamingWithDualRead(config: DualReadIngestionConfig): Promise<void> {
+    this.currentContractId = config.contractId;
+    this.previousContractId = config.previousContractId ?? null;
+    this.stopCurrentStream();
+    this.stopPreviousStreamFn();
+
+    // If in dual-read window, start previous stream first
+    if (config.previousContractId && config.effectiveLedger) {
+      this.logger.log(
+        `Starting dual-read streams: previous=${config.previousContractId}, current=${config.contractId}, effective ledger=${config.effectiveLedger}`,
+      );
+      this.stopPreviousStream = await this.openStreamAsync(config.previousContractId);
+    }
+
+    // Always open current stream
+    await this.openStream(config.contractId);
   }
 
   // ---------------------------------------------------------------------------
@@ -192,24 +229,136 @@ export class StellarIngestionService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private scheduleReconnect(contractId: string): void {
+  private stopPreviousStreamFn(): void {
+    if (this.stopPreviousStream) {
+      try {
+        this.stopPreviousStream();
+      } catch {
+        // ignore
+      }
+      this.stopPreviousStream = null;
+    }
+  }
+
+  private async openStreamAsync(contractId: string): Promise<() => void> {
+    const streamId = `contract:${contractId}`;
+    const cursor = await this.cursorRepo.getCursor(streamId);
+
+    this.logger.log(
+      cursor
+        ? `Resuming stream ${streamId} from cursor ${cursor}`
+        : `Starting stream ${streamId} from "now"`,
+    );
+
+    const eventsBuilder = (
+      this.server as unknown as {
+        contractEvents(contractId: string): {
+          cursor(c: string): unknown;
+          stream(opts: {
+            onmessage: (record: unknown) => void;
+            onerror: (err: unknown) => void;
+          }): () => void;
+        };
+      }
+    ).contractEvents?.(contractId);
+
+    if (!eventsBuilder) {
+      return this.openRawSseStream(contractId, streamId, cursor);
+    }
+
+    const cursoredBuilder = cursor
+      ? eventsBuilder.cursor(cursor)
+      : eventsBuilder.cursor("now");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const stop = (cursoredBuilder as any).stream({
+      onmessage: (record: unknown) => {
+        void this.handleRecord(record as RawHorizonContractEvent, streamId);
+      },
+      onerror: (err: unknown) => {
+        this.logger.error(`Stream error for ${streamId}: ${String(err)}`);
+        this.stopCurrentStream();
+        this.scheduleReconnect(contractId);
+      },
+    }) as () => void;
+
+    this.currentBackoffMs = INITIAL_BACKOFF_MS;
+    return stop;
+  }
+
+  private async scheduleReconnect(contractId: string): Promise<void> {
     if (this.destroyed) return;
 
-    this.logger.warn(
-      `Reconnecting stream for contract ${contractId} in ${this.currentBackoffMs}ms`,
-    );
+    // Get the last cursor for this contract
+    const streamId = `contract:${contractId}`;
+    const lastCursor = await this.cursorRepo.getCursor(streamId);
 
-    this.reconnectTimer = setTimeout(() => {
-      if (!this.destroyed) {
-        void this.openStream(contractId);
-      }
-    }, this.currentBackoffMs);
+    if (!lastCursor) {
+      this.logger.warn(
+        `No cursor found for contract ${contractId} - cannot enqueue reconnect job`,
+      );
+      // Fall back to in-process reconnection
+      this.logger.warn(
+        `Reconnecting stream for contract ${contractId} in ${this.currentBackoffMs}ms (in-process fallback)`,
+      );
 
-    // Exponential back-off with cap
-    this.currentBackoffMs = Math.min(
-      this.currentBackoffMs * BACKOFF_MULTIPLIER,
-      MAX_BACKOFF_MS,
-    );
+      this.reconnectTimer = setTimeout(() => {
+        if (!this.destroyed) {
+          void this.openStream(contractId);
+        }
+      }, this.currentBackoffMs);
+
+      // Exponential back-off with cap
+      this.currentBackoffMs = Math.min(
+        this.currentBackoffMs * BACKOFF_MULTIPLIER,
+        MAX_BACKOFF_MS,
+      );
+      return;
+    }
+
+    // Enqueue stellar_reconnect job via JobQueueService
+    // Requirements: 11.2, 11.5
+    try {
+      const payload: StellarReconnectPayload = {
+        contractId,
+        lastCursor,
+      };
+
+      const jobId = await this.jobQueueService.enqueue(
+        JobType.STELLAR_RECONNECT,
+        payload,
+      );
+
+      this.logger.log(
+        `SSE stream disconnected - reconnect job enqueued: ${jobId} ` +
+        `(contractId: ${contractId}, lastCursor: ${lastCursor})`,
+      );
+
+      // Reset backoff since we successfully enqueued the job
+      this.currentBackoffMs = INITIAL_BACKOFF_MS;
+    } catch (err) {
+      this.logger.error(
+        `Failed to enqueue reconnect job for contract ${contractId}: ${(err as Error).message}`,
+        (err as Error).stack,
+      );
+
+      // Fall back to in-process reconnection
+      this.logger.warn(
+        `Reconnecting stream for contract ${contractId} in ${this.currentBackoffMs}ms (in-process fallback)`,
+      );
+
+      this.reconnectTimer = setTimeout(() => {
+        if (!this.destroyed) {
+          void this.openStream(contractId);
+        }
+      }, this.currentBackoffMs);
+
+      // Exponential back-off with cap
+      this.currentBackoffMs = Math.min(
+        this.currentBackoffMs * BACKOFF_MULTIPLIER,
+        MAX_BACKOFF_MS,
+      );
+    }
   }
 
   // ---------------------------------------------------------------------------

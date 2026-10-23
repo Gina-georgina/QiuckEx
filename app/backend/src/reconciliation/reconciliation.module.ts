@@ -1,18 +1,49 @@
-import { Module } from "@nestjs/common";
+import { Module, forwardRef } from "@nestjs/common";
 
 import { AppConfigModule } from "../config";
 import { SupabaseModule } from "../supabase/supabase.module";
+import { MetricsModule } from "../metrics/metrics.module";
+import { IngestionModule } from "../ingestion/ingestion.module";
+import { JobQueueModule } from "../job-queue/job-queue.module";
+import { FeatureFlagsModule } from "../feature-flags/feature-flags.module";
+import { AuditModule } from "../audit/audit.module";
+import { PreviewScopeModule } from "../preview-scope/preview-scope.module";
+import { AuthModule } from "../auth/auth.module";
+import { IndexerLagModule } from "../indexer-lag/indexer-lag.module";
 import { ReconciliationService } from "./reconciliation.service";
 import { ReconciliationWorkerService } from "./reconciliation-worker.service";
+import { BackfillService } from "./backfill.service";
+import { AutoMatchService } from "./auto-match.service";
+import { UnmatchedQueueRepository } from "./unmatched-queue.repository";
 import { ReconciliationController } from "./reconciliation.controller";
 
-/**
- * ScheduleModule is registered once at AppModule level.
- */
 @Module({
-  imports: [AppConfigModule, SupabaseModule],
-  providers: [ReconciliationService, ReconciliationWorkerService],
+  imports: [
+    AppConfigModule,
+    SupabaseModule,
+    MetricsModule,
+    IngestionModule,
+    forwardRef(() => JobQueueModule),
+    FeatureFlagsModule,
+    AuditModule,
+    PreviewScopeModule,
+    AuthModule,
+    IndexerLagModule,
+  ],
+  providers: [
+    ReconciliationService,
+    ReconciliationWorkerService,
+    BackfillService,
+    AutoMatchService,
+    UnmatchedQueueRepository,
+  ],
   controllers: [ReconciliationController],
-  exports: [ReconciliationWorkerService],
+  exports: [
+    ReconciliationService,
+    ReconciliationWorkerService,
+    BackfillService,
+    AutoMatchService,
+    UnmatchedQueueRepository,
+  ],
 })
 export class ReconciliationModule {}

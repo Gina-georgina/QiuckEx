@@ -1,145 +1,308 @@
-import { Link } from 'expo-router';
-import React from 'react';
-import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { Link, useRouter } from "expo-router";
+import React, { useEffect } from "react";
+import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+
+import NotificationCenter from "../components/notifications/NotificationCenter";
+import { useNotifications } from "../components/notifications/NotificationContext";
+import { useOnboarding } from "../hooks/useOnboarding";
+import { useTheme } from "../src/theme/ThemeContext";
+import { useTranslation } from 'react-i18next';
 
 export default function HomeScreen() {
-    return (
-        <SafeAreaView style={styles.container}>
-            <View style={styles.content}>
-                <Text style={styles.title}>QuickEx</Text>
+  const { t } = useTranslation();
+  const router = useRouter();
+  const { theme } = useTheme();
+  const { hasCompletedOnboarding, isLoading } = useOnboarding();
+  const {
+    currentAccountId,
+    isSyncing,
+    lastSyncedAt,
+    recentActivity,
+    syncNow,
+  } = useNotifications();
 
-                <Text style={styles.subtitle}>
-                    Fast, privacy-focused payment link platform built on Stellar.
-                </Text>
+  useEffect(() => {
+    if (!isLoading && !hasCompletedOnboarding) {
+      router.replace("/onboarding");
+    }
+  }, [hasCompletedOnboarding, isLoading, router]);
 
-                <View style={styles.card}>
-                    <Text style={styles.cardTitle}>Instant Payments</Text>
-                    <Text style={styles.cardText}>
-                        Receive USDC, XLM, or any Stellar asset directly to your self-custody wallet.
+  if (isLoading || !hasCompletedOnboarding) {
+    return null;
+  }
+
+  return (
+    <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}> 
+      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+        <View style={styles.headerRow}>
+          <View style={styles.headerCopy}>
+            <Text style={[styles.title, { color: theme.textPrimary }]}>{t("appTitle")}</Text>
+            <Text style={[styles.subtitle, { color: theme.textSecondary }]}>{t("appSubtitle")}</Text>
+          </View>
+          <NotificationCenter />
+        </View>
+
+        <View style={[styles.heroCard, { backgroundColor: theme.surface, borderColor: theme.border }]}> 
+          <Text style={[styles.heroTitle, { color: theme.textPrimary }]}>{t("instantPayments")}</Text>
+          <Text style={[styles.cardText, { color: theme.textSecondary }]}>{t("instantPaymentsDesc")}</Text>
+          <Text style={[styles.heroText, { color: theme.textSecondary }]}> 
+            {currentAccountId
+              ? `Watching ${shorten(currentAccountId)} for new activity.`
+              : "Connect a wallet to start syncing activity and badge counts."}
+          </Text>
+          <View style={styles.heroMetaRow}>
+            <Text style={[styles.heroMeta, { color: theme.textMuted }]}> 
+              {isSyncing
+                ? "Syncing now..."
+                : lastSyncedAt
+                ? `Last synced ${new Date(lastSyncedAt).toLocaleTimeString()}`
+                : "Not synced yet"}
+            </Text>
+            <Pressable
+              style={[styles.syncButton, { backgroundColor: theme.buttonPrimaryBg }]}
+              onPress={() => {
+                void syncNow();
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Sync notifications"
+              accessibilityHint="Refreshes recent activity and notification data"
+            >
+              <Text style={[styles.syncButtonText, { color: theme.buttonPrimaryText }]} allowFontScaling> 
+                {t("syncNow")}
+              </Text>
+            </Pressable>
+          </View>
+        </View>
+
+        <View style={[styles.sectionCard, { backgroundColor: theme.surface, borderColor: theme.border }]}> 
+          <View style={styles.sectionHeader}>
+            <Text style={[styles.sectionTitle, { color: theme.textPrimary }]}>{t("recentActivityTitle")}</Text>
+            <Link
+              href={{
+                pathname: "/transactions",
+                params: currentAccountId ? { accountId: currentAccountId } : undefined,
+              }}
+              asChild
+            >
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="View all transactions"
+                accessibilityHint="Opens the full transaction list"
+              >
+                <Text style={[styles.linkText, { color: theme.link }]} allowFontScaling>{t("viewAll")}</Text>
+              </Pressable>
+            </Link>
+          </View>
+
+          {recentActivity.length > 0 ? (
+            recentActivity.slice(0, 5).map((item) => {
+              const incoming = item.destination === currentAccountId;
+              return (
+                <View key={item.pagingToken} style={[styles.activityRow, { borderColor: theme.borderLight }]}> 
+                  <View style={styles.activityCopy}>
+                    <Text style={[styles.activityTitle, { color: theme.textPrimary }]}> 
+                      {incoming ? t("received") : t("sent")} {formatAmount(item.amount)} {assetCode(item.asset)}
                     </Text>
+                    <Text style={[styles.activitySubtitle, { color: theme.textSecondary }]}> 
+                      {incoming ? t("from") : t("to")} {shorten(incoming ? item.source ?? "" : item.destination ?? "")} • {new Date(item.timestamp).toLocaleString()}
+                    </Text>
+                  </View>
                 </View>
+              );
+            })
+          ) : (
+            <Text style={[styles.emptyState, { color: theme.textSecondary }]}> 
+              {t("noRecentActivity")}
+            </Text>
+          )}
+        </View>
 
-                <Link href="/scan-to-pay" asChild>
-                    <TouchableOpacity style={styles.primaryButton}>
-                        <Text style={styles.primaryButtonText}>Scan to Pay</Text>
-                    </TouchableOpacity>
-                </Link>
+        <View style={styles.buttonGroup}>
+          <NavButton href="/scan-to-pay" label={t("scanToPay")} />
+          <NavButton href="/wallet-connect" label={t("connectWallet")} />
+          <NavButton href="/quick-receive" label={t("quickReceive")} />
+          <NavButton href="/contacts" label={t("contacts")} />
+          <NavButton href="/settings" label={t("settings")} secondary />
+          <NavButton href="/security" label={t("securitySettings")} secondary />
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
 
-                <Link href="/wallet-connect" asChild>
-                    <TouchableOpacity style={styles.primaryButton}>
-                        <Text style={styles.primaryButtonText}>Connect Wallet</Text>
-                    </TouchableOpacity>
-                </Link>
+function NavButton({
+  href,
+  label,
+  secondary = false,
+}: {
+  href: string;
+  label: string;
+  secondary?: boolean;
+}) {
+  const { theme } = useTheme();
 
-                {/* Quick Receive */}
-                <Link href="/quick-receive" asChild>
-                    <TouchableOpacity style={styles.quickReceiveButton}>
-                        <Text style={styles.quickReceiveButtonText}>
-                            Quick Receive
-                        </Text>
-                    </TouchableOpacity>
-                </Link>
+  return (
+    <Link href={href as never} asChild>
+      <Pressable
+        style={[
+          styles.navButton,
+          secondary
+            ? {
+                backgroundColor: theme.surface,
+                borderColor: theme.buttonSecondaryBorder,
+                borderWidth: 1,
+              }
+            : { backgroundColor: theme.buttonPrimaryBg },
+        ]}
+        accessibilityRole="button"
+        accessibilityLabel={label}
+        accessibilityHint={`Opens the ${label.toLowerCase()} screen`}
+      >
+        <Text
+          style={[
+            styles.navButtonText,
+            secondary
+              ? { color: theme.buttonSecondaryText }
+              : { color: theme.buttonPrimaryText },
+          ]}
+        >
+          {label}
+        </Text>
+      </Pressable>
+    </Link>
+  );
+}
 
-                {/* Transaction History */}
-                <Link href="/transactions" asChild>
-                    <TouchableOpacity style={styles.secondaryButton}>
-                        <Text style={styles.secondaryButtonText}>
-                            Transaction History
-                        </Text>
-                    </TouchableOpacity>
-                </Link>
-            </View>
-        </SafeAreaView>
-    );
+function assetCode(asset: string) {
+  const separator = asset.indexOf(":");
+  return separator === -1 ? asset : asset.slice(0, separator);
+}
+
+function formatAmount(amount: string) {
+  const value = Number(amount);
+  if (Number.isNaN(value)) return amount;
+  return value.toFixed(2);
+}
+
+function shorten(value: string) {
+  if (!value) return "Unknown";
+  if (value.length <= 12) return value;
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
 }
 
 const styles = StyleSheet.create({
-    container: {
-        flex: 1,
-        backgroundColor: '#ffffff',
-    },
-    content: {
-        flex: 1,
-        padding: 24,
-        justifyContent: 'center',
-        alignItems: 'center',
-    },
-    title: {
-        fontSize: 42,
-        fontWeight: 'bold',
-        color: '#000',
-        marginBottom: 8,
-    },
-    subtitle: {
-        fontSize: 18,
-        color: '#666',
-        textAlign: 'center',
-        marginBottom: 40,
-    },
-    card: {
-        width: '100%',
-        padding: 20,
-        borderRadius: 12,
-        backgroundColor: '#f5f5f5',
-        marginBottom: 30,
-    },
-    cardTitle: {
-        fontSize: 20,
-        fontWeight: '600',
-        color: '#333',
-        marginBottom: 8,
-    },
-    cardText: {
-        fontSize: 16,
-        color: '#555',
-        lineHeight: 22,
-    },
-
-    /* Primary Button */
-    primaryButton: {
-        backgroundColor: '#000',
-        paddingVertical: 16,
-        paddingHorizontal: 32,
-        borderRadius: 8,
-        width: '100%',
-        alignItems: 'center',
-        marginBottom: 12,
-    },
-    primaryButtonText: {
-        color: '#fff',
-        fontSize: 18,
-        fontWeight: 'bold',
-    },
-    /* Quick Receive Button */
-    quickReceiveButton: {
-        backgroundColor: '#10B981',
-        paddingVertical: 16,
-        paddingHorizontal: 32,
-        borderRadius: 8,
-        width: '100%',
-        alignItems: 'center',
-        marginBottom: 12,
-    },
-    quickReceiveButtonText: {
-        color: '#fff',
-        fontSize: 18,
-        fontWeight: '600',
-    },
-
-    /* Secondary Button */
-    secondaryButton: {
-        paddingVertical: 16,
-        paddingHorizontal: 32,
-        borderRadius: 8,
-        width: '100%',
-        alignItems: 'center',
-        borderWidth: 1,
-        borderColor: '#000',
-    },
-    secondaryButtonText: {
-        color: '#000',
-        fontSize: 18,
-        fontWeight: '600',
-    },
+  container: { flex: 1 },
+  content: {
+    padding: 24,
+    gap: 18,
+  },
+  headerRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    gap: 12,
+  },
+  headerCopy: {
+    flex: 1,
+  },
+  title: {
+    fontSize: 36,
+    fontWeight: "800",
+    marginBottom: 8,
+  },
+  subtitle: {
+    fontSize: 16,
+    lineHeight: 22,
+  },
+  heroCard: {
+    borderRadius: 20,
+    borderWidth: 1,
+    padding: 18,
+    gap: 10,
+  },
+  heroTitle: {
+    fontSize: 20,
+    fontWeight: "700",
+  },
+  cardText: {
+    fontSize: 14,
+    lineHeight: 20,
+    marginBottom: 12,
+  },
+  heroText: {
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  heroMetaRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 12,
+  },
+  heroMeta: {
+    flex: 1,
+    fontSize: 12,
+  },
+  syncButton: {
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+  },
+  syncButtonText: {
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  sectionCard: {
+    borderRadius: 20,
+    borderWidth: 1,
+    padding: 18,
+  },
+  sectionHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 10,
+  },
+  sectionTitle: {
+    fontSize: 18,
+    fontWeight: "700",
+  },
+  linkText: {
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  activityRow: {
+    borderBottomWidth: 1,
+    paddingVertical: 12,
+  },
+  activityCopy: {
+    gap: 4,
+  },
+  activityTitle: {
+    fontSize: 15,
+    fontWeight: "700",
+  },
+  activitySubtitle: {
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  emptyState: {
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  buttonGroup: {
+    gap: 12,
+    marginBottom: 16,
+  },
+  navButton: {
+    paddingVertical: 16,
+    paddingHorizontal: 18,
+    borderRadius: 14,
+    alignItems: "center",
+  },
+  navButtonText: {
+    fontSize: 16,
+    fontWeight: "700",
+  },
 });

@@ -1,16 +1,28 @@
 {
   "name": "quickex",
   "private": true,
-  "packageManager": "pnpm@9.0.0",
+  "packageManager": "pnpm@10.33.0",
   "scripts": {
     "dev": "turbo run dev",
     "build": "turbo run build",
     "lint": "turbo run lint",
     "type-check": "turbo run type-check",
-    "test": "turbo run test"
+    "test": "turbo run test",
+    "test:mutation": "pnpm --filter @quickex/backend run test:mutation",
+    "db:migrate": "pnpm --filter @quickex/backend run db:migrate",
+    "db:rollback": "bash scripts/rollback-migration.sh",
+    "db:verify-migrations": "pnpm --filter @quickex/backend run db:verify-migrations",
+    "test:perf:horizon": "pnpm --filter @quickex/backend run test:perf:horizon",
+    "check:generated-types": "node scripts/check-generated-types.js",
+    "check:docs": "node scripts/docs-check/check.mjs",
+    "test:docs": "node --test scripts/docs-check/__tests__/docs.test.mjs",
+    "secret-scan": "bash scripts/secret-scan.sh",
+    "secret-scan:verify": "bash scripts/secret-scan.sh --verify",
+    "secret-scan:full": "bash scripts/secret-scan.sh --full"
   },
   "devDependencies": {
-    "turbo": "^2.3.3"
+    "turbo": "^2.11.7",
+    "typescript": "7.0.2"
   },
   "pnpm": {
     "neverBuiltDependencies": [
@@ -18,6 +30,8 @@
     ]
   },
   "dependencies": {
-    "pnpm": "^10.30.1"
+    "node-fetch": "3",
+    "stellar-sdk": "^13.3.0",
+    "toml": "^5.0.0"
   }
 }

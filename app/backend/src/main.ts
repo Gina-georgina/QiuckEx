@@ -1,3 +1,6 @@
+// Sentry instrumentation MUST be imported before everything else
+import "./sentry/instrument";
+
 import "reflect-metadata";
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -6,52 +9,108 @@ import { NestFactory } from "@nestjs/core"; //installed
 import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
 import helmet from "helmet";
 
-
 import { WinstonModule } from "nest-winston";
 import { winstonConfig } from "./common/logging/winston.config";
 import { LoggingInterceptor } from "./common/interceptors/logging.interceptor";
 // ----------------------------------------
 
-import { AppModule } from "./app.module";
+import { buildCorsOptions } from "./config/cors.config";
 import { AppConfigService } from "./config";
+import { AppModule } from "./app.module";
+import { resolveNetworkSnapshot } from "./config/network.config";
 import { GlobalHttpExceptionFilter } from "./common/filters/global-http-exception.filter";
 import { mapValidationErrors } from "./common/utils/validation-error.mapper";
+import { SentryExceptionFilter, SentryService } from "./sentry";
+import { MetricsService } from "./metrics/metrics.service";
+import { OpenApiDocumentHolder } from "./common/swagger/openapi-document.holder";
+import { 
+  sanitizeErrorMessage,
+  createConfigSummary 
+} from "./common/utils/redaction.util";
+
+/**
+ * Validates critical configuration at startup.
+ * Fails fast if required settings are missing.
+ */
+function validateCriticalConfig(
+  config: AppConfigService,
+  logger: Logger,
+): void {
+  const errors: string[] = [];
+
+  // Database is required
+  if (!config.supabaseUrl) {
+    errors.push('SUPABASE_URL is required');
+  }
+  if (!config.supabaseAnonKey) {
+    errors.push('SUPABASE_ANON_KEY is required');
+  }
+
+  // Network is required
+  if (!config.network) {
+    errors.push('NETWORK is required (must be "testnet" or "mainnet")');
+  }
+
+  try {
+    resolveNetworkSnapshot();
+  } catch (error) {
+    errors.push(`Network config invalid: ${(error as Error).message}`);
+  }
+
+  // If there are critical errors, fail fast
+  if (errors.length > 0) {
+    const errorMessage = `Critical configuration errors:\n${errors.map(e => `  - ${e}`).join('\n')}`;
+    logger.error(errorMessage);
+    throw new Error(sanitizeErrorMessage(errorMessage));
+  }
+
+  // Log warnings for optional but important configurations
+  if (!config.isPaymentSigningConfigured) {
+    logger.warn('STELLAR_SECRET_KEY not configured - payment signing disabled (read-only mode)');
+  }
+
+  logger.log('Critical configuration validated successfully');
+}
 
 async function bootstrap() {
-  
   const logger = new Logger("Bootstrap");
 
   const app = await NestFactory.create(AppModule, {
-    
     logger: WinstonModule.createLogger(winstonConfig),
   });
 
   const configService = app.get(AppConfigService);
 
-  
-  const allowedOrigins = [
-    "http://localhost:3000",
-    "https://app.quickex.example.com", 
-  ];
+  // Validate critical configuration at startup
+  validateCriticalConfig(configService, logger);
+
+  // Log configuration summary (safe, no secrets)
+  const envSummary = createConfigSummary({
+    SUPABASE_URL: configService.supabaseUrl,
+    SUPABASE_ANON_KEY: configService.supabaseAnonKey,
+    NETWORK: configService.network,
+    HORIZON_URL: configService.horizonUrl,
+    SOROBAN_RPC_URL: configService.sorobanRpcUrl,
+    STELLAR_EXPLORER_URL: configService.stellarExplorerUrl,
+    STELLAR_SECRET_KEY: configService.stellarSecretKey,
+    STELLAR_PUBLIC_KEY: configService.stellarPublicKey,
+  });
+  logger.log(envSummary);
+  const networkSnapshot = resolveNetworkSnapshot();
+  logger.log(
+    `Active network: ${networkSnapshot.network} (${networkSnapshot.passphrase}); horizon=${networkSnapshot.horizonUrl}; soroban=${networkSnapshot.sorobanRpcUrl}; explorer=${networkSnapshot.explorerUrl}`,
+  );
 
   // Use Helmet for security headers
   app.use(helmet());
-  app.enableCors({
-    origin: (origin, callback) => {
-      if (!origin) {
-        return callback(null, true);
-      }
-      if (allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        logger.warn(`CORS blocked request from origin: ${origin}`);
-        callback(new Error(`Origin not allowed by CORS: ${origin}`));
-      }
-    },
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "x-correlation-id"], 
-  });
+
+  app.enableCors(
+    buildCorsOptions({
+      nodeEnv: configService.nodeEnv,
+      allowedOrigins: configService.corsAllowedOrigins,
+      vercelProject: configService.corsVercelProject,
+    }),
+  );
 
   // Global validation pipe
   app.useGlobalPipes(
@@ -70,11 +129,16 @@ async function bootstrap() {
     }),
   );
 
-  
   app.useGlobalInterceptors(new LoggingInterceptor());
-  
 
-  app.useGlobalFilters(new GlobalHttpExceptionFilter(configService));
+  // Register Sentry exception filter FIRST so it captures errors,
+  // then the existing HTTP exception filter handles the response.
+  const sentryService = app.get(SentryService);
+  const metricsService = app.get(MetricsService);
+  app.useGlobalFilters(
+    new SentryExceptionFilter(sentryService, configService),
+    new GlobalHttpExceptionFilter(configService, metricsService),
+  );
 
   // Swagger setup
   const swaggerConfig = new DocumentBuilder()
@@ -89,20 +153,40 @@ async function bootstrap() {
     .addTag("links", "Payment link validation and metadata endpoints")
     .addTag("transactions", "Stellar transaction and payment history")
     .addTag("scam-alerts", "Fraud detection and link scanning")
+    .addTag("analytics", "Dashboard analytics, time-series insights, and report exports")
     .addTag("metrics", "Application performance and health metrics")
+    .addTag("stellar", "Verified assets, path preview, Soroban preflight")
+    .addTag("contracts", "Contract registry publication and discovery")
+    .addTag("developer", "Developer self-service: ping, webhook testing, key management, health score")
+    .addGlobalResponse({
+      status: 200,
+      description: "Successful response",
+      headers: {
+        "X-Correlation-ID": {
+          description:
+            "Correlation ID for tracing the request across services. Echoed from the request when provided, otherwise generated by the server.",
+          schema: { type: "string" },
+        },
+      },
+    })
     .build();
 
   const document = SwaggerModule.createDocument(app, swaggerConfig);
+  // Store the validated spec for the POST /docs/json export endpoint and for
+  // the CI spec-divergence check.
+  OpenApiDocumentHolder.get().set(document as unknown as Record<string, unknown>);
   SwaggerModule.setup("docs", app, document, {
     swaggerOptions: {
       persistAuthorization: true,
+      tryItOutEnabled: true,
     },
   });
 
   const port = configService.port;
-  await app.listen(port);
+  // Bind to 0.0.0.0 so devices on your LAN can access the dev server.
+  await app.listen(port, "0.0.0.0");
 
-  logger.log(`Backend listening on http://localhost:${port}`);
+  logger.log(`Backend listening on http://0.0.0.0:${port}`);
   logger.log(`Swagger docs available at http://localhost:${port}/docs`);
 }
 

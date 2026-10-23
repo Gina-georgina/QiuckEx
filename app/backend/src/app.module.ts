@@ -1,61 +1,209 @@
-import { Module, MiddlewareConsumer, NestModule } from "@nestjs/common";
+import {
+Module,
+MiddlewareConsumer,
+NestModule,
+Type,
+DynamicModule,
+ForwardReference,
+} from "@nestjs/common";
 import { EventEmitterModule } from "@nestjs/event-emitter";
 import { ThrottlerModule } from "@nestjs/throttler";
 import { ScheduleModule } from "@nestjs/schedule";
-import { APP_INTERCEPTOR } from "@nestjs/core";
+import { APP_GUARD, APP_INTERCEPTOR } from "@nestjs/core";
 
 import { AppConfigModule } from "./config";
+import { AssetMetadataModule } from "./asset-metadata/asset-metadata.module";
+import { AssetListingModule } from "./asset-listing/asset-listing.module";
 import { HealthModule } from "./health/health.module";
 import { StellarModule } from "./stellar/stellar.module";
 import { SupabaseModule } from "./supabase/supabase.module";
 import { UsernamesModule } from "./usernames/usernames.module";
 import { MetricsModule } from "./metrics/metrics.module";
+import { AnalyticsModule } from "./analytics/analytics.module";
 import { LinksModule } from "./links/links.module";
 import { ScamAlertsModule } from "./scam-alerts/scam-alerts.module";
 import { TransactionsModule } from "./transactions/transactions.module";
+import { PaymentsModule } from "./payments/payments.module";
 import { ReconciliationModule } from "./reconciliation/reconciliation.module";
 import { MetricsMiddleware } from "./metrics/metrics.middleware";
 import { MetricsInterceptor } from "./metrics/metrics.interceptor";
+import { BulkOperationsModule } from "./bulk-operations/bulk-operations.module";
 import { CorrelationIdMiddleware } from "./common/middleware/correlation-id.middleware";
+import { OrganizationContextMiddleware } from "./common/middleware/organization-context.middleware";
+import { ShadowTrafficMiddleware } from "./environment-parity/shadow-traffic.middleware";
 import { NotificationsModule } from "./notifications/notifications.module";
 import { IngestionModule } from "./ingestion/ingestion.module";
+import { ApiKeysModule } from "./api-keys/api-keys.module";
+import { MarketplaceModule } from "./marketplace/marketplace.module";
+import { SentryModule } from "./sentry";
+import { FiatRampsModule } from "./fiat-ramps/fiat-ramps.module";
+import { RefundsModule } from "./refunds/refunds.module";
+import { ExportsModule } from "./exports/exports.module";
+import { JobQueueModule } from "./job-queue/job-queue.module";
+import { AuditModule } from "./audit/audit.module";
+import { FeatureFlagsModule } from "./feature-flags/feature-flags.module";
+import { DeveloperModule } from "./developer/developer.module";
+import { PrivacyModule } from "./privacy/privacy.module";
+import { ContractsModule } from "./contracts/contracts.module";
+import { SorobanToolingModule } from "./soroban-tooling/soroban-tooling.module";
+import { OrganizationRoleGuard } from "./auth/guards/organization-role.guard";
+import { RateLimitConfigService } from "./config/rate-limit.config";
+import { RedisSlidingWindowRateLimitGuard } from "./config/redis-sliding-window-rate-limit.guard";
+import { EnvironmentParityModule } from "./environment-parity/environment-parity.module";
+import { IndexerLagModule } from "./indexer-lag";
+import { SupportBundleModule } from "./support-bundle/support-bundle.module";
+import { OperationsModule } from "./operations/operations.module";
+import { RcValidationModule } from "./rc-validation/rc-validation.module";
+import { AbuseSignalsModule } from "./abuse-signals/abuse-signal.module";
+import { AbuseSignalMiddleware } from "./abuse-signals/abuse-signal.middleware";
+import { PreviewScopeModule } from "./preview-scope/preview-scope.module";
+import { PreviewScopeMiddleware } from "./preview-scope/preview-scope.middleware";
+import { BranchPreviewModule } from "./branch-preview/branch-preview.module";
+import { RuntimeConfigModule } from "./runtime-config/runtime-config.module";
+import { TransactionTimelineModule } from "./transaction-timeline/transaction-timeline.module";
+import { DashboardFeedModule } from "./dashboard-feed/dashboard-feed.module";
+import { ContactsModule } from "./contacts/contacts.module";
+import { TeamsModule } from "./teams/teams.module";
+import { ReceiptsModule } from "./receipts/receipts.module";
+import { SessionModule } from "./session/session.module";
+import { ObservabilityModule } from "./observability/observability.module";
+import { TestnetFixturesModule } from "./testnet-fixtures/testnet-fixtures.module";
+import { TracingMiddleware } from "./observability/tracing/tracing.middleware";
+import { ApiCompatibilityModule } from "./api-compatibility/api-compatibility.module";
+
+type AppImport =
+| Type<unknown>
+| DynamicModule
+| Promise<DynamicModule>
+| ForwardReference<unknown>;
 
 @Module({
-  imports: [
-    AppConfigModule,
-    // ScheduleModule registered once here — shared by NotificationsModule and ReconciliationModule
-    ScheduleModule.forRoot(),
-    EventEmitterModule.forRoot({
-      wildcard: true,
-      delimiter: ".",
-    }),
-    ThrottlerModule.forRoot([
-      {
-        ttl: 60000,
-        limit: 20,
-      },
-    ]),
-    SupabaseModule,
-    HealthModule,
-    StellarModule,
-    UsernamesModule,
-    MetricsModule,
-    LinksModule,
-    ScamAlertsModule,
-    TransactionsModule,
-    NotificationsModule,
-    ReconciliationModule,
-    IngestionModule,
-  ],
-  providers: [
-    {
-      provide: APP_INTERCEPTOR,
-      useClass: MetricsInterceptor,
-    },
-  ],
+imports: ((): AppImport[] => {
+const baseImports: AppImport[] = [
+SentryModule,
+AppConfigModule,
+ScheduleModule.forRoot(),
+EventEmitterModule.forRoot({
+wildcard: true,
+delimiter: ".",
+}),
+    BulkOperationsModule,
+  ThrottlerModule.forRootAsync({
+    inject: [RateLimitConfigService],
+    useFactory: (rateLimitConfig: RateLimitConfigService) =>
+      rateLimitConfig.getThrottlerModuleProfiles(),
+  }),
+SupabaseModule,
+HealthModule,
+AssetMetadataModule,
+AssetListingModule,
+StellarModule,
+UsernamesModule,
+MetricsModule,
+AnalyticsModule,
+LinksModule,
+ScamAlertsModule,
+TransactionsModule,
+PaymentsModule,
+IngestionModule,
+ApiKeysModule,
+MarketplaceModule,
+ReceiptsModule,
+ContactsModule,
+TeamsModule,
+FiatRampsModule,
+RefundsModule,
+ExportsModule,
+JobQueueModule,
+AuditModule,
+ContractsModule,
+FeatureFlagsModule,
+PrivacyModule,
+SorobanToolingModule,
+EnvironmentParityModule,
+    BranchPreviewModule,
+    RuntimeConfigModule,
+    IndexerLagModule,
+SupportBundleModule,
+OperationsModule,
+    RcValidationModule,
+    AbuseSignalsModule,
+    PreviewScopeModule,
+    TransactionTimelineModule,
+    DashboardFeedModule,
+    SessionModule,
+ObservabilityModule,
+    TestnetFixturesModule,
+    ApiCompatibilityModule,
+    ];
+
+    try {
+  const supabaseUrl = process.env.SUPABASE_URL ?? "";
+  const isLocalSupabase =
+    supabaseUrl.includes("localhost") ||
+    supabaseUrl.includes("127.0.0.1");
+
+  if (!isLocalSupabase) {
+    baseImports.push(ReconciliationModule as AppImport);
+    baseImports.push(NotificationsModule as AppImport);
+    baseImports.push(DeveloperModule as AppImport);
+  } else {
+    console.log(
+      "Skipping Reconciliation & Notifications modules in dev (local Supabase)",
+    );
+  }
+} catch (e) {
+  baseImports.push(ReconciliationModule as AppImport);
+  baseImports.push(NotificationsModule as AppImport);
+  baseImports.push(DeveloperModule as AppImport);
+}
+
+return baseImports;
+
+})(),
+providers: [
+{
+provide: APP_GUARD,
+useClass: RedisSlidingWindowRateLimitGuard,
+},
+{
+provide: APP_INTERCEPTOR,
+useClass: MetricsInterceptor,
+},
+{
+provide: APP_GUARD,
+useClass: OrganizationRoleGuard,
+},
+],
 })
 export class AppModule implements NestModule {
-  configure(consumer: MiddlewareConsumer) {
-    consumer.apply(MetricsMiddleware, CorrelationIdMiddleware).forRoutes("*");
-  }
+configure(consumer: MiddlewareConsumer) {
+  // Correlation id must be established first so every subsequent middleware,
+  // guard, interceptor, and filter can attach it to logs and error responses.
+  consumer
+    .apply(CorrelationIdMiddleware)
+    .forRoutes("*");
+
+  consumer
+    .apply(
+      MetricsMiddleware,
+      OrganizationContextMiddleware,
+      ShadowTrafficMiddleware,
+    )
+    .forRoutes("*");
+
+  consumer
+    .apply(AbuseSignalMiddleware)
+    .forRoutes("payment-links", "links");
+
+  // Tracing runs after the correlation id so a log line can carry both, and
+  // before any route handler so a dependency failure is always attributable.
+  consumer
+    .apply(TracingMiddleware)
+    .forRoutes("*");
+
+  consumer
+    .apply(PreviewScopeMiddleware)
+    .forRoutes("*");
+}
 }

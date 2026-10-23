@@ -1,59 +1,112 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { NextIntlClientProvider } from "next-intl";
+import { getLocale, getMessages } from "next-intl/server";
+import { Header } from "@/components/Header";
+import { StagingBanner } from "@/components/StagingBanner";
+import { EnvGuard } from "@/components/EnvGuard";
+import { NotificationCenterProvider } from "@/components/NotificationCenterProvider";
+import { ErrorReportingShell } from "@/components/ErrorReportingShell";
+import { ThemeProvider, themeInitScript } from "@/components/ThemeProvider";
+import { BootstrapProvider } from "@/contexts/BootstrapContext";
+import { defaultLocale, getDirection, isLocale } from "@/i18n/config";
 import "./globals.css";
-import Link from "next/link";
-import { NetworkBadge } from "@/components/NetworkBadge";
 
-const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
-const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
+const siteUrl =
+  (process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") || "https://quickex.to");
 
 export const metadata: Metadata = {
-  title: "QuickEx",
+  metadataBase: new URL(siteUrl),
+  title: {
+    default: "QuickEx",
+    template: "%s | QuickEx",
+  },
   description: "Privacy-focused payments on Stellar",
+  applicationName: "QuickEx",
+  keywords: ["Stellar", "payments", "crypto", "XLM", "USDC", "payment link"],
+  authors: [{ name: "Pulsefy" }],
+  creator: "Pulsefy",
+  openGraph: {
+    type: "website",
+    siteName: "QuickEx",
+    title: "QuickEx — Privacy-focused payments on Stellar",
+    description: "Privacy-focused payments on Stellar",
+    url: siteUrl,
+    images: [
+      {
+        url: "/api/og",
+        width: 1200,
+        height: 630,
+        alt: "QuickEx — Privacy-focused payments on Stellar",
+      },
+    ],
+  },
+  twitter: {
+    card: "summary_large_image",
+    site: "@quickex",
+    title: "QuickEx — Privacy-focused payments on Stellar",
+    description: "Privacy-focused payments on Stellar",
+    images: ["/api/og"],
+  },
+  robots: {
+    index: true,
+    follow: true,
+  },
 };
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default async function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const requestedLocale = await getLocale();
+  const locale = isLocale(requestedLocale) ? requestedLocale : defaultLocale;
+  const messages = await getMessages();
+  const dir = getDirection(locale);
+
   return (
-    <html lang="en">
-      <body className={`${geistSans.variable} ${geistMono.variable} antialiased bg-neutral-950 text-white`}>
-         
-        
-        <header className="border-b border-white/5 bg-neutral-950/60 backdrop-blur-xl sticky top-0 z-50">
-          <nav className="container mx-auto px-6 py-4 flex justify-between items-center">
-            <Link href="/" className="flex items-center gap-2">
-              <div className="w-8 h-8 bg-indigo-500 rounded-lg flex items-center justify-center font-bold italic">
-                Q
-              </div>
-              <span className="text-xl font-bold tracking-tight">QuickEx</span>
-            
-            </Link>
-  <NetworkBadge />
-            <div className="hidden md:flex gap-8 text-sm text-neutral-400 font-medium">
-              <Link href="/dashboard" className="hover:text-white transition">Dashboard</Link>
-              <Link href="/generator" className="hover:text-white transition">Generator</Link>
-            </div>
+    <html lang={locale} dir={dir} suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
+      </head>
+      <body className="bg-background text-foreground antialiased">
+        <NextIntlClientProvider locale={locale} messages={messages}>
+          <StagingBanner />
+          <ThemeProvider>
+            <BootstrapProvider>
+              <NotificationCenterProvider>
+                <EnvGuard>
+                  <Header />
+                  <ErrorReportingShell>
+                    <main
+                      id="main-content"
+                      tabIndex={-1}
+                      className="min-h-screen container mx-auto px-6 py-10 focus:outline-none"
+                    >
+                      {children}
+                    </main>
+                  </ErrorReportingShell>
 
-           
-            <div className="md:hidden text-neutral-400">☰</div>
-          </nav>
-        </header>
-
-        
-        <main className="min-h-screen container mx-auto px-6 py-10">
-          {children}
-        </main>
-
-       
-        <footer className="container mx-auto px-6 py-12 border-t border-white/5 text-neutral-500 text-sm">
-          <div className="flex flex-col md:flex-row justify-between items-center gap-6">
-            <p>© 2026 QuickEx Platform. Built by Pulsefy.</p>
-            <div className="flex gap-8 underline underline-offset-4 decoration-white/10 hover:decoration-white/20">
-              <a href="https://github.com/pulsefy/QuickEx" target="_blank">GitHub</a>
-              <a href="#">Terms</a>
-              <a href="#">Privacy</a>
-            </div>
-          </div>
-        </footer>
+                  <footer className="container mx-auto border-t border-border px-6 py-12 text-sm text-subtle">
+                    <div className="flex flex-col items-center justify-between gap-6 md:flex-row">
+                      <p>Copyright 2026 QuickEx Platform. Built by Pulsefy.</p>
+                      <div className="flex gap-8 underline decoration-border underline-offset-4 hover:decoration-border-strong">
+                        <a
+                          href="https://github.com/pulsefy/QuickEx"
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          GitHub
+                        </a>
+                        <a href="#">Terms</a>
+                        <a href="#">Privacy</a>
+                      </div>
+                    </div>
+                  </footer>
+                </EnvGuard>
+              </NotificationCenterProvider>
+            </BootstrapProvider>
+          </ThemeProvider>
+        </NextIntlClientProvider>
       </body>
     </html>
   );

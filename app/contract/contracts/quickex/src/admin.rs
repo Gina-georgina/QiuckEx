@@ -1,80 +1,374 @@
 use crate::errors::QuickexError;
-use crate::events::{publish_admin_changed, publish_contract_paused};
+use crate::events::{
+    publish_admin_changed, publish_contract_initialized, publish_contract_migrated,
+    publish_contract_paused, publish_contract_upgraded, publish_fee_collector_rotated,
+    publish_per_asset_fee_set, publish_upgrade_completed, publish_upgrade_started,
+};
+use crate::fee;
+use crate::fee_router;
 use crate::storage;
-use soroban_sdk::{Address, Env};
+use crate::types::{FeeConfig, PerAssetFeeConfig, Role, TtlExtensionFeeConfig};
+use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
 
 /// Initialize the contract with an admin address.
 ///
 /// This is a one-time operation; subsequent calls fail with [`AlreadyInitialized`].
-/// The initial admin is allowed to pause/unpause, transfer admin, and upgrade.
-#[allow(dead_code)]
+/// The initial admin is assigned the [`Role::Admin`] role.
 pub fn initialize(env: &Env, admin: Address) -> Result<(), QuickexError> {
-    if has_admin(env) {
+    if storage::is_initialized(env) || has_admin(env) {
         return Err(QuickexError::AlreadyInitialized);
     }
 
-    // Seed admin and paused flags in persistent storage.
+    // Set initial admin address (singleton for compatibility).
     storage::set_admin(env, &admin);
-    storage::set_paused(env, false);
+    let mut signers = Vec::new(env);
+    signers.push_back(admin.clone());
+    storage::set_admin_signers(env, &signers);
+    storage::set_admin_threshold(env, 1);
+    storage::set_admin_approval_round(env, 0);
+    storage::set_admin_approval_count(env, 0);
+    storage::set_admin_approval_ready(env, false);
+    storage::set_paused(env, false, 0);
+    storage::set_schema_version(env, storage::SCHEMA_VERSION);
+
+    // Grant Admin role to the initial administrator.
+    let mut roles = Vec::new(env);
+    roles.push_back(Role::Admin);
+    storage::set_roles(env, &admin, &roles);
+
+    // Mark the contract initialized only after all initialization writes succeed.
+    storage::set_initialized(env, true);
+
+    // Emit the initialization snapshot for indexers.
+    publish_contract_initialized(
+        env,
+        admin,
+        storage::CURRENT_CONTRACT_VERSION,
+        crate::events::EVENT_SCHEMA_VERSION,
+        false,
+    );
 
     Ok(())
 }
 
 /// Check if admin has been initialized.
-#[allow(dead_code)]
 pub fn has_admin(env: &Env) -> bool {
     storage::get_admin(env).is_some()
 }
 
-/// Get the current admin address.
-///
-/// Returns `None` if the contract has not been initialised.
-#[allow(dead_code)]
+/// Require that one-time contract initialization has completed.
+pub fn require_initialized(env: &Env) -> Result<(), QuickexError> {
+    if storage::is_initialized(env) {
+        Ok(())
+    } else {
+        Err(QuickexError::Unauthorized)
+    }
+}
+
+/// Get the current primary admin address.
 pub fn get_admin(env: &Env) -> Option<Address> {
     storage::get_admin(env)
 }
 
-/// Require that the caller is the admin (with auth).
-///
-/// - Fails with [`Unauthorized`] if no admin is set.
-/// - Fails with [`Unauthorized`] if `caller` ≠ stored admin.
-#[allow(dead_code)]
-pub fn require_admin(env: &Env, caller: &Address) -> Result<(), QuickexError> {
-    caller.require_auth();
-
-    match storage::get_admin(env) {
-        Some(admin) if admin == *caller => Ok(()),
-        _ => Err(QuickexError::Unauthorized),
+/// Initialize the contract with a threshold of signatures from `signers`.
+pub fn initialize_multisig(
+    env: &Env,
+    signers: Vec<Address>,
+    threshold: u32,
+) -> Result<(), QuickexError> {
+    if storage::is_initialized(env) || has_admin(env) {
+        return Err(QuickexError::AlreadyInitialized);
     }
-}
+    validate_signers(env, &signers, threshold)?;
 
-/// Set a new admin address (**admin only**).
-///
-/// Emits an `AdminChanged` event for indexers.
-#[allow(dead_code)]
-pub fn set_admin(env: &Env, caller: Address, new_admin: Address) -> Result<(), QuickexError> {
-    require_admin(env, &caller)?;
+    let primary = signers.get(0).ok_or(QuickexError::Unauthorized)?;
+    storage::set_admin(env, &primary);
+    storage::set_admin_signers(env, &signers);
+    storage::set_admin_threshold(env, threshold);
+    storage::set_admin_approval_round(env, 0);
+    storage::set_admin_approval_count(env, 0);
+    storage::set_admin_approval_ready(env, false);
+    storage::set_paused(env, false, 0);
+    storage::set_schema_version(env, storage::SCHEMA_VERSION);
 
-    // Safe to unwrap: `require_admin` guarantees an admin is set.
-    let old_admin = storage::get_admin(env).unwrap();
-    storage::set_admin(env, &new_admin);
-
-    publish_admin_changed(env, old_admin, new_admin);
-
+    for signer in signers.iter() {
+        let mut roles = storage::get_roles(env, &signer);
+        if !roles.contains(Role::Admin) {
+            roles.push_back(Role::Admin);
+            storage::set_roles(env, &signer, &roles);
+        }
+    }
+    storage::set_initialized(env, true);
+    publish_contract_initialized(
+        env,
+        primary,
+        storage::CURRENT_CONTRACT_VERSION,
+        crate::events::EVENT_SCHEMA_VERSION,
+        false,
+    );
     Ok(())
 }
 
-/// Set the paused state (**admin only**).
-///
-/// Emits a `ContractPaused` event whenever the flag changes.
-#[allow(dead_code)]
-pub fn set_paused(env: &Env, caller: Address, new_state: bool) -> Result<(), QuickexError> {
+fn validate_signers(
+    env: &Env,
+    signers: &Vec<Address>,
+    threshold: u32,
+) -> Result<(), QuickexError> {
+    if signers.len() == 0 || threshold == 0 || threshold > signers.len() {
+        return Err(QuickexError::InvalidAmount);
+    }
+    let mut seen = Vec::new(env);
+    for signer in signers.iter() {
+        if seen.contains(&signer) {
+            return Err(QuickexError::InvalidAmount);
+        }
+        seen.push_back(signer);
+    }
+    Ok(())
+}
+
+pub fn get_admin_signers(env: &Env) -> Vec<Address> {
+    storage::get_admin_signers(env).unwrap_or_else(|| {
+        let mut signers = Vec::new(env);
+        if let Some(admin) = storage::get_admin(env) {
+            signers.push_back(admin);
+        }
+        signers
+    })
+}
+
+pub fn get_admin_threshold(env: &Env) -> u32 {
+    storage::get_admin_threshold(env).unwrap_or(1)
+}
+
+/// Approve the next privileged admin action. A quorum is consumed by the next
+/// successful Admin-only mutation.
+pub fn approve_admin_action(env: &Env, caller: &Address) -> Result<u32, QuickexError> {
+    require_initialized(env)?;
+    caller.require_auth();
+    let signers = get_admin_signers(env);
+    if !signers.contains(caller) {
+        return Err(QuickexError::InsufficientRole);
+    }
+
+    let round = storage::get_admin_approval_round(env);
+    if storage::get_signer_approval_round(env, caller) == round {
+        return Err(QuickexError::AdminActionAlreadyApproved);
+    }
+    storage::set_signer_approval_round(env, caller, round);
+    let count = storage::get_admin_approval_count(env).saturating_add(1);
+    storage::set_admin_approval_count(env, count);
+    if count >= get_admin_threshold(env) {
+        storage::set_admin_approval_ready(env, true);
+    }
+    Ok(count)
+}
+
+fn consume_admin_approval(env: &Env, caller: &Address) -> Result<(), QuickexError> {
+    if get_admin_threshold(env) == 1 {
+        return Ok(());
+    }
+    if !get_admin_signers(env).contains(caller) {
+        return Err(QuickexError::InsufficientRole);
+    }
+    if !storage::is_admin_approval_ready(env) {
+        return Err(QuickexError::InsufficientVotes);
+    }
+    let next_round = storage::get_admin_approval_round(env)
+        .checked_add(1)
+        .ok_or(QuickexError::InternalError)?;
+    storage::set_admin_approval_round(env, next_round);
+    storage::set_admin_approval_count(env, 0);
+    storage::set_admin_approval_ready(env, false);
+    Ok(())
+}
+
+pub fn configure_multisig(
+    env: &Env,
+    caller: &Address,
+    signers: Vec<Address>,
+    threshold: u32,
+) -> Result<(), QuickexError> {
+    require_admin(env, caller)?;
+    validate_signers(env, &signers, threshold)?;
+
+    let old_signers = get_admin_signers(env);
+    for old_signer in old_signers.iter() {
+        if !signers.contains(&old_signer) {
+            let roles = storage::get_roles(env, &old_signer);
+            let mut new_roles = Vec::new(env);
+            for role in roles {
+                if role != Role::Admin {
+                    new_roles.push_back(role);
+                }
+            }
+            storage::set_roles(env, &old_signer, &new_roles);
+        }
+    }
+    storage::set_admin_signers(env, &signers);
+    storage::set_admin_threshold(env, threshold);
+    storage::set_admin_approval_round(env, 0);
+    storage::set_admin_approval_count(env, 0);
+    storage::set_admin_approval_ready(env, false);
+    for signer in signers.iter() {
+        let mut roles = storage::get_roles(env, &signer);
+        if !roles.contains(Role::Admin) {
+            roles.push_back(Role::Admin);
+            storage::set_roles(env, &signer, &roles);
+        }
+    }
+    Ok(())
+}
+
+/// Check if an address has a specific role.
+pub fn has_role(env: &Env, address: &Address, role: Role) -> bool {
+    let roles = storage::get_roles(env, address);
+    roles.iter().any(|granted| role_includes(granted, role))
+}
+
+/// Return whether a granted role includes the requested permission role.
+/// Admin inherits operational permissions; dispute arbitration stays separate.
+fn role_includes(granted: Role, requested: Role) -> bool {
+    matches!(
+        (granted, requested),
+        (Role::Admin, Role::Admin)
+            | (Role::Admin, Role::Operator)
+            | (Role::Operator, Role::Operator)
+            | (Role::Arbiter, Role::Arbiter)
+    )
+}
+
+/// Require that the caller has at least one of the specified roles.
+pub fn require_any_role(env: &Env, caller: &Address, roles: &[Role]) -> Result<(), QuickexError> {
+    require_initialized(env)?;
+
+    if storage::governance_is_initialized(env) {
+        if storage::governance_execution_in_progress(env) {
+            return Ok(());
+        }
+        return Err(QuickexError::GovernanceRequired);
+    }
+
+    caller.require_auth();
+    let user_roles = storage::get_roles(env, caller);
+    for role in roles {
+        if user_roles.iter().any(|granted| role_includes(granted, *role)) {
+            if *role == Role::Admin {
+                consume_admin_approval(env, caller)?;
+            }
+            return Ok(());
+        }
+    }
+    // Fallback: legacy deployments may not have role assignments.
+    // Legacy deployments may have only the primary admin address. It inherits
+    // operational access, but not dispute arbitration.
+    if roles
+        .iter()
+        .any(|role| *role == Role::Admin || *role == Role::Operator)
+    {
+        if let Some(admin) = storage::get_admin(env) {
+            if admin == *caller {
+                consume_admin_approval(env, caller)?;
+                return Ok(());
+            }
+        }
+    }
+    Err(QuickexError::InsufficientRole)
+}
+
+/// Require that the caller is an Admin.
+pub fn require_admin(env: &Env, caller: &Address) -> Result<(), QuickexError> {
+    require_any_role(env, caller, &[Role::Admin])
+}
+
+/// Grant a role to an address (**Admin only**).
+pub fn grant_role(
+    env: &Env,
+    caller: Address,
+    target: Address,
+    role: Role,
+) -> Result<(), QuickexError> {
     require_admin(env, &caller)?;
 
-    storage::set_paused(env, new_state);
+    let mut roles = storage::get_roles(env, &target);
+    if !roles.contains(role) {
+        roles.push_back(role);
+        storage::set_roles(env, &target, &roles);
+    }
+    Ok(())
+}
 
-    publish_contract_paused(env, caller, new_state);
+/// Revoke a role from an address (**Admin only**).
+pub fn revoke_role(
+    env: &Env,
+    caller: Address,
+    target: Address,
+    role: Role,
+) -> Result<(), QuickexError> {
+    require_admin(env, &caller)?;
 
+    let roles = storage::get_roles(env, &target);
+    let mut new_roles = Vec::new(env);
+    for r in roles {
+        if r != role {
+            new_roles.push_back(r);
+        }
+    }
+    storage::set_roles(env, &target, &new_roles);
+    Ok(())
+}
+
+/// Set a new primary admin address (**Admin only**).
+pub fn set_admin(env: &Env, caller: Address, new_admin: Address) -> Result<(), QuickexError> {
+    require_admin(env, &caller)?;
+
+    let old_admin = storage::get_admin(env).unwrap();
+    if get_admin_threshold(env) > 1 && !get_admin_signers(env).contains(&new_admin) {
+        return Err(QuickexError::InsufficientRole);
+    }
+    storage::set_admin(env, &new_admin);
+
+    // A multisig signer remains an Admin when the primary signer changes.
+    if get_admin_threshold(env) == 1 {
+        let roles = storage::get_roles(env, &old_admin);
+        let mut new_roles = Vec::new(env);
+        for r in roles {
+            if r != Role::Admin {
+                new_roles.push_back(r);
+            }
+        }
+        storage::set_roles(env, &old_admin, &new_roles);
+    }
+
+    // Grant Admin role to new admin if not already present.
+    let mut roles = storage::get_roles(env, &new_admin);
+    if !roles.contains(Role::Admin) {
+        roles.push_back(Role::Admin);
+        storage::set_roles(env, &new_admin, &roles);
+    }
+
+    publish_admin_changed(env, old_admin, new_admin);
+    Ok(())
+}
+
+/// Set the paused state (**Admin or Operator only**).
+#[allow(dead_code)]
+pub fn set_paused(
+    env: &Env,
+    caller: Address,
+    new_state: bool,
+    reason: u32,
+) -> Result<(), QuickexError> {
+    require_any_role(env, &caller, &[Role::Admin, Role::Operator])?;
+
+    storage::set_paused(env, new_state, reason);
+    publish_contract_paused(env, caller.clone(), new_state, reason);
+
+    if new_state {
+        crate::events::publish_pause_enabled(env, caller, true, 0, reason);
+    } else {
+        crate::events::publish_pause_disabled(env, caller, true, 0, reason);
+    }
     Ok(())
 }
 
@@ -83,13 +377,489 @@ pub fn is_paused(env: &Env) -> bool {
     storage::is_paused(env)
 }
 
-/// Require that the contract is not paused.
+pub fn get_version(env: &Env) -> u32 {
+    storage::get_contract_version(env).unwrap_or(storage::LEGACY_CONTRACT_VERSION)
+}
+
+/// Get the stored schema version (`0` for legacy deployments prior to schema tracking).
+pub fn get_schema_version(env: &Env) -> u32 {
+    storage::get_schema_version(env).unwrap_or(storage::LEGACY_SCHEMA_VERSION)
+}
+
+/// Validate that the incoming schema version is a sequential single-step upgrade
+/// (`new_version == old_version + 1`).
 ///
-/// This helper should be called at the start of operations that are blocked when paused.
+/// Rejects version skips (`new_version > old_version + 1`), same-version re-upgrades,
+/// and downgrades (`new_version <= old_version`) with [`QuickexError::InvalidContractVersion`].
+pub fn validate_schema_version(old_version: u32, new_version: u32) -> Result<(), QuickexError> {
+    match old_version.checked_add(1) {
+        Some(expected) if new_version == expected => Ok(()),
+        _ => Err(QuickexError::InvalidContractVersion),
+    }
+}
+
+/// Perform a version-guarded contract WASM upgrade (**Admin only**).
+///
+/// Reads the on-chain `schema_version` and compares it with the incoming binary's
+/// expected `SCHEMA_VERSION` (or pending upgrade target version if staged).
+/// Aborts with [`QuickexError::InvalidContractVersion`] if `new_version != old_version + 1`.
+pub fn upgrade(
+    env: &Env,
+    caller: &Address,
+    new_wasm_hash: BytesN<32>,
+) -> Result<(), QuickexError> {
+    if storage::governance_is_initialized(env) && !storage::governance_execution_in_progress(env) {
+        return Err(QuickexError::GovernanceRequired);
+    }
+
+    let old_version = get_schema_version(env);
+    if old_version == storage::LEGACY_SCHEMA_VERSION && !storage::is_initialized(env) {
+        let admin = storage::get_admin(env).ok_or(QuickexError::Unauthorized)?;
+        if !storage::governance_execution_in_progress(env) {
+            caller.require_auth();
+            if admin != *caller {
+                return Err(QuickexError::InsufficientRole);
+            }
+        }
+    } else {
+        require_admin(env, caller)?;
+    }
+
+    let new_version =
+        storage::get_pending_upgrade_version(env).unwrap_or(storage::SCHEMA_VERSION);
+    validate_schema_version(old_version, new_version)?;
+
+    storage::set_wasm_hash(env, &new_wasm_hash);
+    #[cfg(not(test))]
+    env.deployer()
+        .update_current_contract_wasm(new_wasm_hash.clone());
+
+    publish_contract_upgraded(env, new_wasm_hash, caller);
+
+    Ok(())
+}
+
+/// Transform contract storage sequentially from the stored `schema_version`
+/// to [`storage::SCHEMA_VERSION`] (**Admin only**).
+///
+/// Idempotent: safe to call multiple times. When storage is already at
+/// `SCHEMA_VERSION`, this function validates post-upgrade invariants and
+/// returns `Ok(SCHEMA_VERSION)` without mutating state or re-emitting events.
+pub fn migrate_schema(env: &Env, caller: &Address) -> Result<u32, QuickexError> {
+    if storage::governance_is_initialized(env) && !storage::governance_execution_in_progress(env) {
+        return Err(QuickexError::GovernanceRequired);
+    }
+
+    let from_version = get_schema_version(env);
+    if from_version == storage::LEGACY_SCHEMA_VERSION {
+        let admin = storage::get_admin(env).ok_or(QuickexError::Unauthorized)?;
+        if !storage::governance_execution_in_progress(env) {
+            caller.require_auth();
+            if admin != *caller {
+                return Err(QuickexError::InsufficientRole);
+            }
+        }
+
+        // Legacy deployments may not have role assignments. Seed Admin role so
+        // post-migration admin checks continue to work.
+        let mut roles = storage::get_roles(env, &admin);
+        if !roles.contains(Role::Admin) {
+            roles.push_back(Role::Admin);
+            storage::set_roles(env, &admin, &roles);
+        }
+    } else {
+        require_admin(env, caller)?;
+    }
+
+    if from_version > storage::SCHEMA_VERSION {
+        return Err(QuickexError::InvalidContractVersion);
+    }
+
+    if let Some(pending_target) = storage::get_pending_upgrade_version(env) {
+        if pending_target > storage::SCHEMA_VERSION
+            || (from_version < pending_target && pending_target != from_version.saturating_add(1))
+        {
+            return Err(QuickexError::InvalidContractVersion);
+        }
+    }
+
+    let mut version = from_version;
+    while version < storage::SCHEMA_VERSION {
+        let next_version = version
+            .checked_add(1)
+            .ok_or(QuickexError::InvalidContractVersion)?;
+        validate_schema_version(version, next_version)?;
+        version = match version {
+            storage::LEGACY_SCHEMA_VERSION => migrate_v0_to_v1(env)?,
+            _ => return Err(QuickexError::InvalidContractVersion),
+        };
+    }
+
+    // Ensure both ContractVersion and SchemaVersion keys are synchronized.
+    storage::set_schema_version(env, version);
+
+    if version != from_version {
+        publish_contract_migrated(env, caller, from_version, version);
+    }
+
+    // Post-upgrade invariant checks (Issue #432 + #450)
+    if let Err(_msg) = storage::assert_post_upgrade_invariants(env) {
+        env.panic_with_error(QuickexError::InternalError);
+    }
+
+    Ok(version)
+}
+
+pub fn migrate(env: &Env, caller: &Address) -> Result<u32, QuickexError> {
+    migrate_schema(env, caller)
+}
+
+fn migrate_v0_to_v1(env: &Env) -> Result<u32, QuickexError> {
+    let admin = storage::get_admin(env).ok_or(QuickexError::Unauthorized)?;
+
+    // Ensure Admin role is seeded for the primary admin.
+    let mut roles = storage::get_roles(env, &admin);
+    if !roles.contains(Role::Admin) {
+        roles.push_back(Role::Admin);
+        storage::set_roles(env, &admin, &roles);
+    }
+
+    // Seed default multisig metadata if absent in v0 storage.
+    if storage::get_admin_signers(env).is_none() {
+        let mut signers = Vec::new(env);
+        signers.push_back(admin.clone());
+        storage::set_admin_signers(env, &signers);
+    }
+    if storage::get_admin_threshold(env).is_none() {
+        storage::set_admin_threshold(env, 1);
+    }
+
+    // Migrate legacy Symbol-based privacy key for admin if present.
+    let legacy_privacy_key = (Symbol::new(env, storage::PRIVACY_ENABLED_KEY), admin.clone());
+    if let Some(legacy_enabled) = env
+        .storage()
+        .persistent()
+        .get::<_, bool>(&legacy_privacy_key)
+    {
+        env.storage()
+            .persistent()
+            .set(&storage::DataKey::PrivacyEnabled(admin), &legacy_enabled);
+        env.storage().persistent().remove(&legacy_privacy_key);
+    }
+
+    storage::set_initialized(env, true);
+    storage::set_schema_version(env, storage::SCHEMA_VERSION);
+    Ok(storage::SCHEMA_VERSION)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Upgrade Gating (Issue #432)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Set the upgrade window during which upgrades are permitted.
+///
+/// **Admin only**. Define `[start, end)` epoch seconds:
+/// - `start` = 0: no window set (upgrades blocked)
+/// - `end` = 0: no upper bound (upgrades allowed from start onwards)
+/// - Validates that start < end (when end != 0)
+pub fn set_upgrade_window(
+    env: &Env,
+    caller: &Address,
+    start: u64,
+    end: u64,
+) -> Result<(), QuickexError> {
+    require_admin(env, caller)?;
+    storage::set_upgrade_window(env, start, end)?;
+    crate::events::publish_upgrade_window_changed(env, caller, start, end);
+    Ok(())
+}
+
+/// Start an upgrade (enters gating state; requires active window).
+///
+/// **Admin only**. Emits `UpgradeStarted` event with old/new versions.
+/// Blocks if window is not active, upgrade already in progress, or if the
+/// target schema version violates sequential version guard rules (gap > 1).
+pub fn start_upgrade(env: &Env, caller: &Address, new_version: u32) -> Result<(), QuickexError> {
+    let old_version = get_schema_version(env);
+    if old_version == storage::LEGACY_SCHEMA_VERSION && !storage::is_initialized(env) {
+        if storage::governance_is_initialized(env) && !storage::governance_execution_in_progress(env)
+        {
+            return Err(QuickexError::GovernanceRequired);
+        }
+        let admin = storage::get_admin(env).ok_or(QuickexError::Unauthorized)?;
+        if !storage::governance_execution_in_progress(env) {
+            caller.require_auth();
+            if admin != *caller {
+                return Err(QuickexError::InsufficientRole);
+            }
+        }
+    } else {
+        require_admin(env, caller)?;
+    }
+
+    // Check upgrade window is active (Issue #432 AC1)
+    if !storage::is_upgrade_window_active(env) {
+        return Err(QuickexError::InvalidAmount);
+    }
+
+    if storage::is_upgrade_in_progress(env) {
+        return Err(QuickexError::ContractPaused);
+    }
+
+    // Pre-flight schema version guard (Issue #450):
+    // Reject version 0, downgrades, or version skips (gap > 1).
+    let max_allowed_version = old_version
+        .checked_add(1)
+        .ok_or(QuickexError::InvalidContractVersion)?;
+    if new_version == 0 || new_version < old_version || new_version > max_allowed_version {
+        return Err(QuickexError::InvalidContractVersion);
+    }
+
+    let (window_start, window_end) = storage::get_upgrade_window(env);
+
+    storage::set_pending_upgrade_version(env, new_version);
+    storage::set_upgrade_in_progress(env, true);
+    publish_upgrade_started(
+        env,
+        caller,
+        old_version,
+        new_version,
+        window_start,
+        window_end,
+    );
+
+    Ok(())
+}
+
+/// Complete an upgrade (migrate state, update version, emit event).
+///
+/// **Admin only**. Must be called after `start_upgrade` to finalize.
+/// Calls `migrate_schema()` internally and re-checks invariants.
+pub fn complete_upgrade(
+    env: &Env,
+    caller: &Address,
+    new_version: u32,
+) -> Result<u32, QuickexError> {
+    let governance_active = storage::governance_is_initialized(env);
+    if !storage::is_upgrade_in_progress(env) {
+        return Err(if governance_active {
+            QuickexError::UpgradeNotInProgress
+        } else {
+            QuickexError::InternalError
+        });
+    }
+
+    if governance_active {
+        if !crate::governance::is_active_signer(env, caller) {
+            return Err(QuickexError::NotGovernanceSigner);
+        }
+        caller.require_auth();
+        let expected_version = storage::get_pending_upgrade_version(env)
+            .ok_or(QuickexError::UpgradeNotInProgress)?;
+        if new_version != expected_version {
+            return Err(QuickexError::InvalidContractVersion);
+        }
+        let old_version = get_schema_version(env);
+        validate_schema_version(old_version, expected_version)?;
+        let authority = storage::get_admin(env).ok_or(QuickexError::Unauthorized)?;
+        storage::set_governance_execution(env, true);
+        let migrated_version = migrate_schema(env, &authority)?;
+        if migrated_version != expected_version {
+            return Err(QuickexError::InvalidContractVersion);
+        }
+        storage::set_governance_execution(env, false);
+        storage::set_upgrade_in_progress(env, false);
+        storage::clear_pending_upgrade_version(env);
+        publish_upgrade_completed(env, caller, old_version, migrated_version);
+        return Ok(migrated_version);
+    }
+
+    let old_version = get_schema_version(env);
+    if new_version > old_version.saturating_add(1)
+        || (new_version != 0 && new_version < old_version)
+    {
+        return Err(QuickexError::InvalidContractVersion);
+    }
+
+    // Run schema migration
+    let migrated_version = migrate_schema(env, caller)?;
+
+    // Ensure new version matches expected (Issue #432 AC2 + #450)
+    if migrated_version != new_version && new_version != 0 {
+        return Err(QuickexError::InvalidContractVersion);
+    }
+
+    storage::set_upgrade_in_progress(env, false);
+    storage::clear_pending_upgrade_version(env);
+    publish_upgrade_completed(env, caller, old_version, migrated_version);
+
+    Ok(migrated_version)
+}
+
+/// Require that the contract is not paused.
 #[allow(dead_code)]
 pub fn require_not_paused(env: &Env) -> Result<(), QuickexError> {
     if is_paused(env) {
         return Err(QuickexError::ContractPaused);
     }
+    Ok(())
+}
+
+/// Set granular pause flags (**Admin or Operator only**).
+pub fn set_pause_flags(
+    env: &Env,
+    caller: &Address,
+    flags_to_enable: u64,
+    flags_to_disable: u64,
+    reason: u32,
+    event_reason: u32,
+) -> Result<(), QuickexError> {
+    require_any_role(env, caller, &[Role::Admin, Role::Operator])?;
+
+    storage::set_pause_flags(env, caller, flags_to_enable, flags_to_disable, reason);
+
+    if flags_to_enable > 0 {
+        crate::events::publish_pause_enabled(
+            env,
+            caller.clone(),
+            false,
+            flags_to_enable,
+            event_reason,
+        );
+    }
+    if flags_to_disable > 0 {
+        crate::events::publish_pause_disabled(
+            env,
+            caller.clone(),
+            false,
+            flags_to_disable,
+            event_reason,
+        );
+    }
+    Ok(())
+}
+
+/// Set fee configuration (**Admin or Operator only**).
+pub fn set_fee_config(env: &Env, caller: &Address, config: FeeConfig) -> Result<(), QuickexError> {
+    require_any_role(env, caller, &[Role::Admin, Role::Operator])?;
+    fee::validate_fee_bps(config.fee_bps)?;
+
+    let old_fee_bps = storage::get_fee_config(env).fee_bps;
+    storage::set_fee_config(env, &config);
+    crate::events::publish_fee_config_changed(env, old_fee_bps, config.fee_bps);
+    Ok(())
+}
+
+/// Set the TTL extension fee model (**Admin or Operator only**).
+pub fn set_ttl_extension_fee_config(
+    env: &Env,
+    caller: &Address,
+    config: TtlExtensionFeeConfig,
+) -> Result<(), QuickexError> {
+    require_any_role(env, caller, &[Role::Admin, Role::Operator])?;
+
+    if config.fee_per_second < 0 || config.min_fee < 0 || config.max_fee < 0 {
+        return Err(QuickexError::InvalidAmount);
+    }
+    if config.max_fee < config.min_fee {
+        return Err(QuickexError::InvalidAmount);
+    }
+
+    storage::set_ttl_extension_fee_config(env, &config);
+    crate::events::publish_ttl_extension_fee_config_changed(
+        env,
+        config.fee_per_second,
+        config.min_fee,
+        config.max_fee,
+    );
+    Ok(())
+}
+
+/// Set per-asset fee configuration (**Admin or Operator only**).
+pub fn set_per_asset_fee(
+    env: &Env,
+    caller: &Address,
+    token: Address,
+    config: PerAssetFeeConfig,
+) -> Result<(), QuickexError> {
+    require_any_role(env, caller, &[Role::Admin, Role::Operator])?;
+
+    fee::validate_fee_bps(config.fee_bps)?;
+    fee::validate_fee_bps(config.arbiter_bps)?;
+
+    let previous = storage::get_per_asset_fee(env, &token);
+    let old_fee_bps = previous.as_ref().map(|c| c.fee_bps).unwrap_or(0);
+    let old_arbiter_bps = previous.as_ref().map(|c| c.arbiter_bps).unwrap_or(0);
+
+    storage::set_per_asset_fee(env, &token, &config);
+    publish_per_asset_fee_set(
+        env,
+        token,
+        old_fee_bps,
+        old_arbiter_bps,
+        config.fee_bps,
+        config.arbiter_bps,
+    );
+    Ok(())
+}
+
+pub fn set_oracle_fee_config(
+    env: &Env,
+    caller: &Address,
+    config: crate::types::OracleFeeConfig,
+) -> Result<(), QuickexError> {
+    require_any_role(env, caller, &[Role::Admin, Role::Operator])?;
+
+    const MAX_STALE_THRESHOLD_SECS: u64 = 3600;
+    if config.stale_threshold_secs > MAX_STALE_THRESHOLD_SECS {
+        return Err(QuickexError::InvalidAmount);
+    }
+
+    storage::set_oracle_fee_config(env, &config);
+    Ok(())
+}
+
+/// Set platform wallet address (**Admin only**).
+pub fn set_platform_wallet(
+    env: &Env,
+    caller: &Address,
+    wallet: Address,
+) -> Result<(), QuickexError> {
+    require_admin(env, caller)?;
+
+    storage::set_platform_wallet(env, &wallet);
+    crate::events::publish_platform_wallet_changed(env, wallet);
+    Ok(())
+}
+
+/// Rotate active fee collector (**Admin only**).
+///
+/// Enforces a 24-hour cooldown between rotations and maintains rotation history.
+///
+/// # Errors
+/// * `InvalidAmount` – Cooldown period has not elapsed since the last rotation
+pub fn rotate_fee_collector(
+    env: &Env,
+    caller: &Address,
+    new_collector: Address,
+) -> Result<u32, QuickexError> {
+    require_admin(env, caller)?;
+
+    let next_index = fee_router::rotate_collector(env, &new_collector)?;
+    publish_fee_collector_rotated(env, new_collector, next_index);
+    Ok(next_index)
+}
+
+/// Set whether a hook contract is allowed to be registered (**Admin only**).
+pub fn set_hook_allowed(
+    env: &Env,
+    caller: &Address,
+    hook_contract: Address,
+    allowed: bool,
+) -> Result<(), QuickexError> {
+    require_admin(env, caller)?;
+
+    storage::set_hook_allowed(env, &hook_contract, allowed);
+    crate::events::publish_hook_allowlist_changed(env, hook_contract, allowed);
     Ok(())
 }

@@ -99,13 +99,34 @@ soroban contract invoke \
 
 ### Mainnet Deployment
 
+Mainnet deployments must use the reviewed gate-enabled deploy script. See [the mainnet deployment gate](documentation/mainnet-deployment-gate.md) for required evidence and trusted reviewer keys.
+
 ```bash
-# Deploy to mainnet (use with caution!)
-soroban contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/quickex.wasm \
-  --source main \
-  --network mainnet
+./scripts/deploy.sh \
+  --network mainnet \
+  --source quickex-mainnet \
+  --admin "$QUICKEX_MAINNET_ADMIN" \
+  --wasm target/wasm32v1-none/release/quickex.wasm \
+  --mainnet-gate /secure/release/mainnet-gate.json \
+  --testnet-manifest /secure/release/testnet-deployment-manifest.json \
+  --audit-report /secure/release/security-audit.pdf
 ```
+
+## Contract Spec Export
+
+Export the contract's method/argument spec, along with the current
+contract and event schema versions, as a stable JSON artifact:
+
+```bash
+./scripts/export-contract-spec.sh
+```
+
+The artifact is written to `docs/contract-spec/contract-spec.json` and
+includes `contract_version`, `event_schema_version`, and the full function
+interface, so contributors and tooling can introspect available methods
+without reading the Rust source. `scripts/test-contract-spec-export.sh`
+verifies the export is stable across repeat builds and includes all
+required fields.
 
 ## Development Workflow
 
@@ -119,7 +140,8 @@ soroban contract deploy \
 
 ### 1. Deployment & initialisation
 1. Deploy the contract WASM.
-2. Call `initialize(admin)` once to set the admin (required for pause, upgrade, admin transfer).
+2. Call `initialize(admin)` once to set the bootstrap admin.
+3. For production, call `initialize_governance(caller, signers, threshold, timelock_secs)` to activate M-of-N governance before configuring funds or production parameters. Once enabled, privileged changes and upgrades require proposals; direct legacy admin calls are rejected.
 
 ### 2. Deposit → Withdraw (escrow)
 1. **Deposit**: Call `deposit(token, amount, owner, salt)` or `deposit_with_commitment(from, token, amount, commitment)`. The owner/from must authorize the token transfer.
@@ -131,9 +153,12 @@ soroban contract deploy \
 - **Level-based**: `enable_privacy(account, level)`, `privacy_status(account)`, `privacy_history(account)` for numeric levels.
 
 ### 4. Admin
-- `set_paused(caller, new_state)` – pause/unpause (caller must be admin).
-- `set_admin(caller, new_admin)` – transfer admin.
-- `upgrade(caller, new_wasm_hash)` – upgrade contract (caller must authorize).
+- Before multisig bootstrap, legacy admin entrypoints can pause, transfer admin, and upgrade.
+- After bootstrap, use `propose_governance_action`, `approve_governance_proposal`, and `execute_governance_proposal` for privileged changes, signer rotation, and timelocked upgrades. Cancellation requires M-of-N cancellation votes.
+- `activate_emergency_mode(caller)` remains an immediate, irreversible stop callable by the bootstrap admin or any active governance signer.
+- `get_version()` – inspect the stored schema version (`0` means a legacy deployment with no version key yet).
+
+See [governance and compatibility guarantees](docs/GOVERNANCE_AND_COMPATIBILITY.md) for stable error codes, signer rotation, upgrade cancellation, and CI resource budgets.
 
 ### 5. Read-only queries
 - `get_commitment_state(commitment)` – escrow status (Pending/Spent/Expired).
@@ -190,7 +215,7 @@ Helper functions:
 
 ### Overview
 
-The amount commitment functions provide a **placeholder** for X-Ray privacy shielded flows. These are deterministic SHA256-based commitments without real zero-knowledge guarantees. Future versions will integrate actual ZK proofs.
+The amount commitment functions provide a **placeholder** for X-Ray privacy shielded flows. These use KECCAK256-based deterministic commitments for optimal security and compatibility with Soroban cryptographic operations. Legacy SHA256 commitments remain accepted for backward compatibility.
 
 ### Use Cases
 
@@ -200,15 +225,35 @@ The amount commitment functions provide a **placeholder** for X-Ray privacy shie
 
 ### Serialization Format
 
-Commitments are computed as `SHA256(owner_bytes || amount_bytes || salt_bytes)`:
+Commitments are computed as `KECCAK256(owner_bytes || amount_bytes || salt_bytes)`:
 
 | Component | Size | Format | Description |
 |-----------|------|--------|-------------|
 | Owner | Variable | XDR-serialized Address | Soroban address bytes |
 | Amount | 16 bytes | Big-endian i128 | Transaction amount value |
-| Salt | 0-256 bytes | Raw bytes | Randomness for uniqueness |
+| Salt | 0-1024 bytes | Raw bytes | Randomness for uniqueness |
 
-**Result**: 32-byte SHA256 hash
+**Result**: 32-byte KECCAK256 hash
+
+#### Legacy SHA256 Migration
+
+For backward compatibility with existing deployments, both KECCAK256 and SHA256 commitments are accepted during verification. The migration strategy is:
+
+- **New deposits** (via `create_amount_commitment`): Use KECCAK256 (more secure, consistent with Soroban crypto ops)
+- **Existing SHA256 commitments**: Continue to verify correctly via `verify_amount_commitment`
+- **Verification paths**: Accept both algorithms transparently
+- **Logging**: Legacy SHA256 commitments are logged as `commitment_type: "legacy"` in events for audit trails
+
+**Deprecation Timeline**:
+- **v1.0** (current): Both KECCAK256 and SHA256 accepted; all new commitments use KECCAK256
+- **v2.0** (planned 2025 Q2): SHA256 verification deprecated but still functional; strong recommendation to migrate
+- **v3.0** (planned 2025 Q4): SHA256 support removed; KECCAK256 only
+
+**Migration Path for Users**:
+1. Verify existing escrows use KECCAK256 hashes where possible
+2. For SHA256-based escrows: Continue using `verify_amount_commitment` (works unchanged)
+3. For new workflows: Exclusively use KECCAK256 via `create_amount_commitment`
+4. Before v3.0: Complete transition to KECCAK256-only workflows
 
 ### API Examples
 
@@ -260,10 +305,11 @@ assert!(!client.verify_amount_commitment(&commitment, &other_owner, &amount, &sa
 ### Constraints & Limitations
 
 - **No confidentiality**: Commitments are deterministic hashes, not ZK proofs. Do not rely on them for privacy.
-- **Maximum salt length**: 256 bytes to prevent resource exhaustion.
-- **Non-negative amounts**: Negative amounts will panic; validate client-side.
+- **Maximum salt length**: 1024 bytes to prevent resource exhaustion.
+- **Non-negative amounts**: Negative amounts will fail validation; validate client-side.
 - **Deterministic only**: Same inputs always produce identical commits; useful for audits but no hiding.
 - **Not production-grade privacy**: Mark this feature as "experimental" in UX; full privacy requires ZK integration.
+- **Algorithm migration**: New workflows use KECCAK256; legacy SHA256 commitments are accepted until v3.0.
 
 ## View Functions (Read-Only RPC Calls)
 

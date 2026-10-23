@@ -10,9 +10,10 @@
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
-      "associatedDomains": [
-        "applinks:quickex.to"
-      ]
+      "associatedDomains": ["applinks:quickex.to", "applinks:www.quickex.to"],
+      "infoPlist": {
+        "UIBackgroundModes": ["fetch"]
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -32,6 +33,11 @@
               "scheme": "https",
               "host": "quickex.to",
               "pathPrefix": "/"
+            },
+            {
+              "scheme": "https",
+              "host": "www.quickex.to",
+              "pathPrefix": "/"
             }
           ],
           "category": ["BROWSABLE", "DEFAULT"]
@@ -44,12 +50,20 @@
     },
     "plugins": [
       "expo-router",
+      "./plugins/withHomeScreenWidgets",
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "QuickEx uses Face ID to protect payments and sensitive wallet data."
+        }
+      ],
       [
         "expo-camera",
         {
           "cameraPermission": "QuickEx needs camera access to scan QR payment codes."
         }
       ],
+      "expo-notifications",
       [
         "expo-splash-screen",
         {

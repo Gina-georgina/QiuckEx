@@ -266,6 +266,53 @@ curl http://localhost:4000/ready
 
 Open `http://localhost:4000/docs` in your browser.
 
+## Container Image
+
+The backend is published as a Docker image to the GitHub Container Registry (GHCR).
+
+### Image name
+
+```
+ghcr.io/viky207/quickex-backend
+```
+
+### Tagging scheme
+
+| Tag | Description |
+| --- | --- |
+| `<commit-sha>` | Immutable tag for each build, matching the Git commit SHA |
+| `latest` | Most recent build from the default branch |
+
+### Required repository secret
+
+Publishing the image requires a `GHCR_TOKEN` repository secret:
+
+- A Personal Access Token (PAT) with the `write:packages` scope, **or**
+- `GITHUB_TOKEN` if the workflow's `permissions` are configured with `packages: write`
+
+### Pull and run locally
+
+```bash
+docker pull ghcr.io/viky207/quickex-backend:latest
+
+docker run -p 4000:4000 --env-file .env ghcr.io/viky207/quickex-backend:latest
+```
+
+The container listens on port `4000` by default. Provide the required environment variables via `--env-file .env` (see [Environment Variables](#environment-variables)).
+
+### Healthcheck
+
+The image exposes a healthcheck endpoint at `/health`:
+
+```bash
+curl http://localhost:4000/health
+```
+
+### Build notes
+
+- **Multi-stage build**: The image is built in multiple stages (dependency install, build, and a slim runtime stage) to keep the final image small.
+- **Non-root user**: The container runs as a non-root user for improved security.
+
 ## Architecture
 
 ```
@@ -298,3 +345,68 @@ pnpm turbo run test --filter=@quickex/backend
 Tests include:
 - Environment schema validation tests (`env.schema.spec.ts`)
 - Integration tests for endpoints (`app.spec.ts`)
+
+## Notifications
+
+The backend includes a comprehensive notification engine that supports multiple channels:
+
+### Supported Channels
+
+- **Email** - via SendGrid
+- **Push Notifications** - via Expo Push (for mobile app)
+- **Webhooks** - for custom integrations
+- **Telegram** - real-time bot notifications ✨
+
+### Telegram Bot Integration
+
+QuickEx supports real-time notifications via Telegram! Users can link their Telegram accounts to receive instant alerts for payments, escrow events, and more.
+
+#### Quick Setup
+
+1. **Create a Telegram Bot**: Use [@BotFather](https://t.me/BotFather) to create a bot and get a token
+2. **Configure environment**: Add `TELEGRAM_BOT_TOKEN=your-token-here` to `.env`
+3. **Install dependencies**: `npm install telegraf`
+4. **Run migrations**: Apply the database migration for Telegram tables
+5. **Restart the server**: The bot will start automatically
+
+For complete setup instructions, user guide, and API documentation, see:
+- **[Telegram Bot Guide](docs/TELEGRAM-BOT-GUIDE.md)** - Complete setup and usage guide
+
+#### User Commands
+
+Users interact with the bot using Telegram commands:
+- `/start` - Link their QuickEx account
+- `/status` - Check linkage status
+- `/settings` - Configure notification preferences
+- `/min <amount>` - Set minimum amount threshold (in XLM)
+- `/enable` / `/disable` - Toggle notifications
+- `/unlink` - Disconnect account
+
+#### API Endpoints
+
+Programmatic access is available via REST API:
+- `GET /telegram/status/:telegramId` - Check linkage status
+- `POST /telegram/verify/:telegramId` - Verify account with code
+- `PUT /telegram/settings/:telegramId` - Update settings
+- `DELETE /telegram/link/:telegramId` - Unlink account
+
+### Event Types
+
+Notifications are triggered for:
+- 💰 Payment received
+- 🔒 Escrow deposited/withdrawn/refunded
+- 🔄 Recurring payment events
+- ✅ Username claimed
+
+### Configuration
+
+Notification providers are configured via environment variables:
+
+| Variable | Channel | Required |
+|----------|---------|----------|
+| `SENDGRID_API_KEY` | Email | No |
+| `SENDGRID_FROM_EMAIL` | Email | No |
+| `EXPO_ACCESS_TOKEN` | Push | No |
+| `TELEGRAM_BOT_TOKEN` | Telegram | No |
+
+Webhook channel requires no credentials and is always available.

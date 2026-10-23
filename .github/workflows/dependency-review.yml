@@ -1,0 +1,63 @@
+name: Dependency Review
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Dependency Review
+      #
+      # This workflow scans dependency manifest and lockfiles for known
+      # vulnerabilities and license violations introduced by a pull request.
+      #
+      # Severity gate:
+      #   - Fails on any vulnerability with CVSS >= 7.0 (high or critical).
+      #
+      # License gate:
+      #   - Denies GPL-2.0 and AGPL-3.0 licensed dependencies.
+      #   - See docs/policies/DEPENDENCY-LICENSE-POLICY.md for the full policy.
+      #
+      # Exception process:
+      #   If a dependency must be introduced despite a vulnerability or license
+      #   finding, request an exception by:
+      #     1. Opening an issue referencing the GHSA ID (or license identifier)
+      #        and the affected package/version.
+      #     2. Documenting the business reason and any compensating controls.
+      #     3. Obtaining approval from the security and legal reviewers listed
+      #        in docs/policies/DEPENDENCY-LICENSE-POLICY.md.
+      #     4. Adding the approved exception to the allow-list below with a
+      #        link to the approval issue.
+      #
+      # Lockfiles scanned:
+      #   - package-lock.json
+      #   - app/frontend/package-lock.json
+      #   - app/backend/package-lock.json
+      #   - app/mobile/package-lock.json
+      #   - pnpm-lock.yaml
+      #   - app/contract/Cargo.lock
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          license-check: true
+          deny-licenses: GPL-2.0, AGPL-3.0
+          # Scan all lockfiles across the monorepo.
+          # The action auto-detects manifests, but we list them explicitly
+          # to ensure every workspace is covered.
+          # Note: dependency-review-action scans the dependency graph for the
+          # repository; the paths below document the lockfiles that must be
+          # present and up to date for complete coverage.
+          # (See docs/policies/DEPENDENCY-LICENSE-POLICY.md for policy details.)
+          comment-summary-in-pr: on-failure

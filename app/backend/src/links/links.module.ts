@@ -1,10 +1,77 @@
-import { Module } from '@nestjs/common';
-import { LinksController } from './links.controller';
-import { LinksService } from './links.service';
+import { Module, forwardRef } from "@nestjs/common";
+import { LinksController } from "./links.controller";
+import { LinksService } from "./links.service";
+import { BulkPaymentLinksController } from "./bulk-payment-links.controller";
+import { BulkPaymentLinksService } from "./bulk-payment-links.service";
+import { RecurringPaymentsController } from "./recurring-payments.controller";
+import { RecurringPaymentsService } from "./recurring-payments.service";
+import { RecurringPaymentsScheduler } from "./recurring-payments.scheduler";
+import { RecurringPaymentsRepository } from "./recurring-payments.repository";
+import { RecurringPaymentProcessor } from "../stellar/recurring-payment-processor";
+import { RecurringLinkTemplateService } from "./recurring-link-template.service";
+import { RecurringLinkTemplateRepository } from "./recurring-link-template.repository";
+import { RecurringLinkTemplateScheduler } from "./recurring-link-template.scheduler";
+import { PaymentLinkController } from "./payment-link.controller";
+import { PaymentLinkService } from "./payment-link.service";
+import { PaymentLinkExpiryService } from './payment-link-expiry.service';
+import { SupabaseModule } from "../supabase/supabase.module";
+import { StellarModule } from "../stellar/stellar.module";
+import { ApiKeysModule } from "../api-keys/api-keys.module";
+import { JobQueueModule } from "../job-queue/job-queue.module";
+import { FeatureFlagsModule } from "../feature-flags/feature-flags.module";
+import { PrivacyModule } from "../privacy/privacy.module";
+import { TransactionsModule } from "../transactions/transactions.module";
+import { AuditModule } from "../audit/audit.module";
+import { MetricsModule } from "../metrics/metrics.module";
+import { MerchantPaymentPreferencesController } from "./merchant-payment-preferences.controller";
+import { MerchantPaymentPreferencesRepository } from "./merchant-payment-preferences.repository";
+import { MerchantPaymentPreferencesService } from "./merchant-payment-preferences.service";
 
 @Module({
-  controllers: [LinksController],
-  providers: [LinksService],
-  exports: [LinksService],
+  controllers: [
+    LinksController,
+    BulkPaymentLinksController,
+    RecurringPaymentsController,
+    PaymentLinkController,
+    MerchantPaymentPreferencesController,
+  ],
+  providers: [
+    LinksService,
+    PaymentLinkExpiryService,
+    BulkPaymentLinksService,
+    RecurringPaymentsService,
+    RecurringPaymentsScheduler,
+    RecurringPaymentsRepository,
+    RecurringPaymentProcessor,
+    RecurringLinkTemplateService,
+    RecurringLinkTemplateRepository,
+    RecurringLinkTemplateScheduler,
+    PaymentLinkService,
+    MerchantPaymentPreferencesRepository,
+    MerchantPaymentPreferencesService,
+  ],
+  exports: [
+    LinksService,
+    PaymentLinkExpiryService,
+    RecurringPaymentsService,
+    BulkPaymentLinksService,
+    RecurringPaymentsRepository,
+    RecurringPaymentProcessor,
+    RecurringLinkTemplateService,
+    RecurringLinkTemplateRepository,
+    RecurringLinkTemplateScheduler,
+    PaymentLinkService,
+  ],
+  imports: [
+    SupabaseModule,
+    StellarModule,
+    ApiKeysModule,
+    FeatureFlagsModule,
+    PrivacyModule,
+    TransactionsModule,
+    AuditModule,
+    MetricsModule,
+    forwardRef(() => JobQueueModule),
+  ],
 })
 export class LinksModule {}

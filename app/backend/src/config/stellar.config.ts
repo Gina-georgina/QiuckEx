@@ -1,4 +1,5 @@
 import { registerAs } from '@nestjs/config';
+import { resolveNetworkSnapshot } from './network.config';
 
 export type Network = 'testnet' | 'mainnet';
 
@@ -51,6 +52,12 @@ export const HORIZON_BASE_URLS: Record<Network, string> = {
   testnet: 'https://horizon-testnet.stellar.org',
   mainnet: 'https://horizon.stellar.org',
 };
+
+// Multi-asset swap (issue #364) feature flag and slippage configuration.
+export const FEATURE_MULTI_ASSET_SWAP_ENV_KEY = 'FEATURE_MULTI_ASSET_SWAP';
+export const SLIPPAGE_TOLERANCE_ENV_KEY = 'SWAP_SLIPPAGE_TOLERANCE';
+export const DEFAULT_SLIPPAGE_TOLERANCE = 0.02;
+export const MAX_SLIPPAGE_TOLERANCE = 0.02;
 
 export class InvalidNetworkError extends Error {
   readonly value: string;
@@ -152,6 +159,28 @@ export function resolveNetwork(
   throw new InvalidNetworkError(value);
 }
 
+export function isMultiAssetSwapEnabled(
+  value: string | undefined = process.env[FEATURE_MULTI_ASSET_SWAP_ENV_KEY],
+): boolean {
+  return typeof value === 'string' && value.trim().toLowerCase() === 'true';
+}
+
+export function resolveSlippageTolerance(
+  value: string | undefined = process.env[SLIPPAGE_TOLERANCE_ENV_KEY],
+): number {
+  if (!value) {
+    return DEFAULT_SLIPPAGE_TOLERANCE;
+  }
+
+  const parsed = Number.parseFloat(value);
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_SLIPPAGE_TOLERANCE;
+  }
+
+  return Math.min(parsed, MAX_SLIPPAGE_TOLERANCE);
+}
+
 export let NETWORK: Network = DEFAULT_NETWORK;
 export let HORIZON_BASE_URL = HORIZON_BASE_URLS[DEFAULT_NETWORK];
 
@@ -165,11 +194,18 @@ export function syncNetworkFromEnv(
 }
 
 export const stellarConfig = registerAs('stellar', () => {
-  const network = syncNetworkFromEnv();
+  const snapshot = resolveNetworkSnapshot();
+  const network = syncNetworkFromEnv(snapshot.network);
 
   return {
     network,
-    horizonBaseUrl: HORIZON_BASE_URLS[network],
+    horizonBaseUrl: snapshot.horizonUrl,
+    sorobanRpcUrl: snapshot.sorobanRpcUrl,
+    sorobanRpcUrls: snapshot.sorobanRpcUrls,
+    explorerUrl: snapshot.explorerUrl,
+    networkPassphrase: snapshot.passphrase,
     supportedAssets: SUPPORTED_ASSETS,
+    multiAssetSwapEnabled: isMultiAssetSwapEnabled(),
+    slippageTolerance: resolveSlippageTolerance(),
   };
 });

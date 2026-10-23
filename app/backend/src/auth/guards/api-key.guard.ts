@@ -1,34 +1,92 @@
 import {
   CanActivate,
   ExecutionContext,
+  ForbiddenException,
   Injectable,
   UnauthorizedException,
-} from '@nestjs/common';
-import * as bcrypt from 'bcrypt';
-import { RATE_LIMITS } from '../../common/constants/rate-limit.constants';
+} from "@nestjs/common";
+import { Reflector } from "@nestjs/core";
+import { ApiKeysService } from "../../api-keys/api-keys.service";
+import { ApiKeyScope } from "../../api-keys/api-keys.types";
+import { throttlerConfig } from "../../config/rate-limit.config";
+import { REQUIRED_SCOPES_KEY } from "../decorators/require-scopes.decorator";
 
 @Injectable()
 export class ApiKeyGuard implements CanActivate {
+  constructor(
+    private readonly apiKeysService: ApiKeysService,
+    private readonly reflector: Reflector,
+  ) {}
+
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest();
-    const apiKey = request.headers['x-api-key'];
+    const rawKey: string | undefined = request.headers["x-api-key"];
 
-    if (!apiKey) return true; // public access allowed
+    const requiredScopes =
+      this.reflector.getAllAndOverride<ApiKeyScope[]>(REQUIRED_SCOPES_KEY, [
+        context.getHandler(),
+        context.getClass(),
+      ]) ?? [];
 
-    const hashedKeys = (process.env.API_KEYS || '').split(',');
+    if (!rawKey) {
+      if (requiredScopes.length > 0) {
+        throw new UnauthorizedException({
+          error: "API_KEY_REQUIRED",
+          message: "An API key is required for this endpoint",
+        });
+      }
+      return true;
+    }
 
-    for (const hash of hashedKeys) {
-      if (await bcrypt.compare(apiKey, hash)) {
-        request.apiKey = {
-          rateLimit: RATE_LIMITS.API_KEY.limit,
-        };
-        return true;
+    const result = await this.apiKeysService.validateKey(rawKey);
+
+    if (!result) {
+      throw new UnauthorizedException({
+        error: "INVALID_API_KEY",
+        message: "API key is invalid",
+      });
+    }
+
+    const { record, hasScope } = result;
+    const headerOrg = request.organizationContext?.organizationId;
+
+    if (headerOrg && record.organization_id && headerOrg !== record.organization_id) {
+      throw new ForbiddenException({
+        error: "ORGANIZATION_MISMATCH",
+        message: "API key is not scoped to the requested organization",
+      });
+    }
+
+    if (this.apiKeysService.isOverQuota(record)) {
+      throw new ForbiddenException({
+        error: "QUOTA_EXCEEDED",
+        message: "Monthly request quota exceeded",
+      });
+    }
+
+    // Check required scopes declared on the handler/controller via @RequireScopes()
+    for (const scope of requiredScopes) {
+      if (!hasScope(scope)) {
+        throw new ForbiddenException({
+          error: "INSUFFICIENT_SCOPE",
+          message: `API key missing required scope: ${scope}`,
+        });
       }
     }
 
-    throw new UnauthorizedException({
-      error: 'INVALID_API_KEY',
-      message: 'API key is invalid',
-    });
+    request.apiKey = {
+      id: record.id,
+      name: record.name,
+      scopes: record.scopes,
+      rateLimit: throttlerConfig.groups.authenticated.sustained.limit,
+      organization_id: record.organization_id,
+    };
+
+    request.organizationContext = {
+      organizationId: headerOrg ?? record.organization_id ?? undefined,
+      role: record.scopes.includes("admin") ? "admin" : "member",
+    };
+
+    return true;
   }
 }

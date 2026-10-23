@@ -1,0 +1,117 @@
+import { Type } from "class-transformer";
+import {
+  IsArray,
+  IsBoolean,
+  IsInt,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  Max,
+  Min,
+  ValidateNested,
+  ArrayMinSize,
+  Matches,
+} from "class-validator";
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
+
+export class FeeBreakdownDto {
+  @ApiProperty({ description: "Network fee estimate in XLM", example: "0.0000100" })
+  networkFee!: string;
+
+  @ApiProperty({ description: "Platform fee estimate in destination asset", example: "0.1000000" })
+  platformFee!: string;
+
+  @ApiProperty({ description: "Total effective fee (network + platform converted to a unified representation if needed, or just platform fee)", example: "0.1000000" })
+  totalFee!: string;
+}
+
+import { PathAssetRefDto } from "./path-preview.dto";
+
+export class CreateQuoteDto {
+  @ApiProperty({ example: "10.5", description: "Amount the recipient receives" })
+  @IsString()
+  @IsNotEmpty()
+  @Matches(/^\d+(\.\d{1,14})?$/, {
+    message: "destinationAmount must be a positive decimal number",
+  })
+  destinationAmount!: string;
+
+  @ApiProperty({ type: PathAssetRefDto })
+  @ValidateNested()
+  @Type(() => PathAssetRefDto)
+  destinationAsset!: PathAssetRefDto;
+
+  @ApiProperty({ type: [PathAssetRefDto], description: "Assets the sender may use" })
+  @IsArray()
+  @ArrayMinSize(1)
+  @ValidateNested({ each: true })
+  @Type(() => PathAssetRefDto)
+  sourceAssets!: PathAssetRefDto[];
+
+  @ApiPropertyOptional({
+    description: "Maximum slippage in basis points (1 bps = 0.01%). Default: 50 (0.5%)",
+    example: 50,
+    minimum: 0,
+    maximum: 10000,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(10000)
+  maxSlippageBps?: number;
+
+  @ApiPropertyOptional({
+    description: "Quote TTL in seconds. Default: 30",
+    example: 30,
+    minimum: 5,
+    maximum: 300,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(5)
+  @Max(300)
+  ttlSeconds?: number;
+
+  @ApiPropertyOptional({
+    description: "Run Soroban preflight simulation to verify transaction feasibility",
+    example: false,
+  })
+  @IsOptional()
+  @IsBoolean()
+  preflight?: boolean;
+
+  @ApiPropertyOptional({
+    description: "Force bypass cache and retrieve fresh rates from Horizon/Soroban",
+    example: false,
+  })
+  @IsOptional()
+  @IsBoolean()
+  revalidate?: boolean;
+}
+
+export class QuotePathDto {
+  @ApiProperty() sourceAsset!: string;
+  @ApiProperty() sourceAmount!: string;
+  @ApiProperty() sourceAmountWithSlippage!: string;
+  @ApiProperty() destinationAsset!: string;
+  @ApiProperty() destinationAmount!: string;
+  @ApiProperty({ type: [String] }) pathHops!: string[];
+  @ApiProperty() rateDescription!: string;
+  @ApiProperty({ type: FeeBreakdownDto }) feeBreakdown!: FeeBreakdownDto;
+}
+
+export class QuoteResponseDto {
+  @ApiProperty({ description: "Unique quote ID" }) quoteId!: string;
+  @ApiProperty({ type: [QuotePathDto] }) paths!: QuotePathDto[];
+  @ApiProperty({ description: "ISO timestamp when this quote expires" }) expiresAt!: string;
+  @ApiProperty({ description: "Slippage tolerance in basis points" }) maxSlippageBps!: number;
+  @ApiProperty({ description: "Horizon URL used for path search" }) horizonUrl!: string;
+  @ApiPropertyOptional({ description: "Preflight simulation result, if requested" })
+  preflight?: { feasible: boolean; error?: string };
+
+  @ApiProperty({ description: "Age of the quote data in seconds", example: 0 })
+  age!: number;
+
+  @ApiProperty({ description: "Source of the quote data (hit or miss)", example: "miss" })
+  cacheSource!: "hit" | "miss";
+}

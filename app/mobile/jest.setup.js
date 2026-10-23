@@ -1,21 +1,94 @@
 // Mock react-native-safe-area-context: replace SafeAreaView with a plain View
-jest.mock('react-native-safe-area-context', () => ({
-    SafeAreaView: ({ children, ...props }) => {
-        const React = require('react');
-        const { View } = require('react-native');
-        return React.createElement(View, props, children);
-    },
-    useSafeAreaInsets: () => ({ top: 0, bottom: 0, left: 0, right: 0 }),
-    SafeAreaProvider: ({ children }) => children,
+jest.mock("react-native-safe-area-context", () => ({
+  SafeAreaView: ({ children, ...props }) => {
+    const React = require("react");
+    const { View } = require("react-native");
+    return React.createElement(View, props, children);
+  },
+  useSafeAreaInsets: () => ({ top: 0, bottom: 0, left: 0, right: 0 }),
+  SafeAreaProvider: ({ children }) => children,
 }));
 
 // Mock vector icons to avoid async font loading in tests
-jest.mock('@expo/vector-icons', () => {
-    return {
-        Ionicons: ({ name, ...props }) => {
-            const React = require('react');
-            const { Text } = require('react-native');
-            return React.createElement(Text, props, name);
-        },
-    };
+jest.mock("@expo/vector-icons", () => {
+  return {
+    Ionicons: ({ name, ...props }) => {
+      const React = require("react");
+      const { Text } = require("react-native");
+      return React.createElement(Text, props, name);
+    },
+  };
 });
+
+jest.mock("expo-local-authentication", () => ({
+  hasHardwareAsync: jest.fn(async () => true),
+  isEnrolledAsync: jest.fn(async () => true),
+  authenticateAsync: jest.fn(async () => ({ success: true })),
+}));
+
+jest.mock("expo-crypto", () => ({
+  CryptoDigestAlgorithm: { SHA256: "SHA-256" },
+  digestStringAsync: jest.fn(async (_algorithm, value) => `hashed:${value}`),
+}));
+
+jest.mock("expo-secure-store", () => {
+  const store = {};
+  return {
+    WHEN_UNLOCKED_THIS_DEVICE_ONLY: "WHEN_UNLOCKED_THIS_DEVICE_ONLY",
+    isAvailableAsync: jest.fn(async () => true),
+    getItemAsync: jest.fn(async (key) => store[key] ?? null),
+    setItemAsync: jest.fn(async (key, value) => {
+      store[key] = value;
+    }),
+    deleteItemAsync: jest.fn(async (key) => {
+      delete store[key];
+    }),
+  };
+});
+
+jest.mock("expo-notifications", () => ({
+  getPermissionsAsync: jest.fn(async () => ({ granted: true, ios: { allowsBadge: true } })),
+  requestPermissionsAsync: jest.fn(async () => ({ granted: true, ios: { allowsBadge: true } })),
+  getExpoPushTokenAsync: jest.fn(async () => ({ data: "ExponentPushToken[abc123]" })),
+  registerForPushNotificationsAsync: jest.fn(async () => ({ data: "ExponentPushToken[abc123]" })),
+  setBadgeCountAsync: jest.fn(async () => true),
+  setNotificationHandler: jest.fn(),
+  scheduleNotificationAsync: jest.fn(async () => "mock-id"),
+  addNotificationResponseReceivedListener: jest.fn(() => ({ remove: jest.fn() })),
+  getLastNotificationResponseAsync: jest.fn(async () => null),
+}));
+
+jest.mock("expo-background-task", () => ({
+  BackgroundTaskResult: {
+    Success: "Success",
+    Failed: "Failed",
+  },
+  registerTaskAsync: jest.fn(async () => undefined),
+  unregisterTaskAsync: jest.fn(async () => undefined),
+}));
+
+jest.mock("expo-task-manager", () => ({
+  defineTask: jest.fn(),
+  isTaskRegisteredAsync: jest.fn(async () => false),
+}));
+
+jest.mock("uuid", () => ({
+  v4: () => "mock-uuid-1234",
+}));
+
+jest.mock("@react-native-community/netinfo", () => ({
+  addEventListener: jest.fn(() => jest.fn()),
+  fetch: jest.fn(async () => ({
+    isConnected: true,
+    isInternetReachable: true,
+    type: "wifi",
+    details: {},
+  })),
+  useNetInfo: jest.fn(() => ({
+    isConnected: true,
+    isInternetReachable: true,
+    type: "wifi",
+  })),
+}));
+
+

@@ -1,0 +1,343 @@
+import {
+  IsString,
+  IsOptional,
+  IsUrl,
+  IsArray,
+  IsIn,
+  IsNumber,
+  IsNotEmpty,
+  Min,
+  MaxLength,
+} from "class-validator";
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
+
+import { SUPPORTED_WEBHOOK_API_VERSIONS } from "../webhook-event-versions";
+import type { NotificationEventType } from "../types/notification.types";
+
+/** Pinned webhook API versions a subscriber may request (#275). */
+const WEBHOOK_API_VERSIONS = [...SUPPORTED_WEBHOOK_API_VERSIONS];
+
+const WEBHOOK_EVENTS: NotificationEventType[] = [
+  "EscrowDeposited",
+  "EscrowWithdrawn",
+  "EscrowRefunded",
+  "payment.received",
+  "username.claimed",
+  "recurring.payment.due",
+  "recurring.payment.executed",
+  "recurring.payment.failed",
+  "recurring.payment.cancelled",
+  "recurring.link.created",
+  "recurring.link.updated",
+  "recurring.link.paused",
+  "recurring.link.resumed",
+  "recurring.link.completed",
+];
+
+export class CreateWebhookDto {
+  @ApiProperty({
+    example: "https://example.com/webhooks/quickex",
+    description: "URL to receive webhook POST requests",
+  })
+  @IsUrl(
+    {
+      protocols: ["http", "https"],
+      require_protocol: true,
+      require_tld: false, // Allow localhost for development
+    },
+    { message: "webhookUrl must be a valid URL" },
+  )
+  webhookUrl!: string;
+
+  @ApiPropertyOptional({
+    example: "my-webhook-1",
+    maxLength: 100,
+    description: "Optional label for this webhook",
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  label?: string;
+
+  @ApiPropertyOptional({
+    type: [String],
+    enum: WEBHOOK_EVENTS,
+    nullable: true,
+    description:
+      "Event types to subscribe to. null = all events. Default: all payment events",
+    example: ["payment.received", "EscrowDeposited"],
+  })
+  @IsOptional()
+  @IsArray()
+  @IsIn(WEBHOOK_EVENTS, { each: true })
+  events?: NotificationEventType[] | null;
+
+  @ApiPropertyOptional({
+    description:
+      "Minimum amount in stroops to trigger webhook (0 = no threshold)",
+    example: 100000000, // 1 XLM
+  })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  minAmountStroops?: number;
+
+  @ApiPropertyOptional({
+    example: "whsec_mysecretkey123",
+    description:
+      "Custom secret for signing payloads. If not provided, a secure secret will be generated.",
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  secret?: string;
+
+  @ApiPropertyOptional({
+    enum: WEBHOOK_API_VERSIONS,
+    example: "v1",
+    description:
+      "Webhook API version to pin this subscriber to. Omit to use the default " +
+      "version. Deliveries always carry the pinned version plus the current " +
+      "schema version of the event, so a subscriber can migrate deliberately.",
+  })
+  @IsOptional()
+  @IsIn(WEBHOOK_API_VERSIONS)
+  apiVersion?: string;
+}
+
+export class UpdateWebhookDto {
+  @ApiPropertyOptional({
+    example: "https://example.com/webhooks/quickex",
+    description: "URL to receive webhook POST requests",
+  })
+  @IsOptional()
+  @IsUrl(
+    {
+      protocols: ["http", "https"],
+      require_protocol: true,
+      require_tld: false,
+    },
+    { message: "webhookUrl must be a valid URL" },
+  )
+  webhookUrl?: string;
+
+  @ApiPropertyOptional({
+    example: "my-webhook-1",
+    maxLength: 100,
+    description: "Optional label for this webhook",
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  label?: string;
+
+  @ApiPropertyOptional({
+    type: [String],
+    enum: WEBHOOK_EVENTS,
+    nullable: true,
+    description: "Event types to subscribe to. null = all events.",
+  })
+  @IsOptional()
+  @IsArray()
+  @IsIn(WEBHOOK_EVENTS, { each: true })
+  events?: NotificationEventType[] | null;
+
+  @ApiPropertyOptional({
+    description: "Minimum amount in stroops to trigger webhook",
+  })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  minAmountStroops?: number;
+
+  @ApiPropertyOptional({
+    enum: WEBHOOK_API_VERSIONS,
+    example: "v2",
+    description:
+      "Change the pinned webhook API version. Omit to keep the current pin — " +
+      "an update never silently moves a subscriber to a different schema version.",
+  })
+  @IsOptional()
+  @IsIn(WEBHOOK_API_VERSIONS)
+  apiVersion?: string;
+
+  @ApiPropertyOptional({
+    description: "Enable or disable this webhook",
+  })
+  @IsOptional()
+  enabled?: boolean;
+}
+
+export class WebhookResponseDto {
+  @ApiProperty() id!: string;
+  @ApiProperty() publicKey!: string;
+  @ApiProperty() webhookUrl!: string;
+  @ApiPropertyOptional() label?: string;
+  @ApiProperty({
+    description: "Secret key for verifying webhook signatures",
+    example: "whsec_xxxxxxxxxxxxxxxx",
+  })
+  secret!: string;
+  @ApiProperty({
+    enum: WEBHOOK_API_VERSIONS,
+    example: "v1",
+    description: "Webhook API version this subscriber is pinned to",
+  })
+  apiVersion?: string;
+  @ApiPropertyOptional({ type: [String], nullable: true }) events!:
+    | NotificationEventType[]
+    | null;
+  @ApiProperty() minAmountStroops!: string;
+  @ApiProperty() enabled!: boolean;
+  @ApiProperty() createdAt!: string;
+  @ApiProperty() updatedAt!: string;
+}
+
+export class WebhookDeliveryLogDto {
+  @ApiProperty() id!: string;
+  @ApiProperty() eventType!: string;
+  @ApiProperty() eventId!: string;
+  @ApiProperty() status!: string;
+  @ApiProperty() attempts!: number;
+  @ApiPropertyOptional() lastError?: string;
+  @ApiPropertyOptional() httpStatus?: number;
+  @ApiPropertyOptional() responseBody?: string;
+  @ApiProperty() createdAt!: string;
+  @ApiPropertyOptional() deliveredAt?: string;
+}
+
+export class WebhookStatsDto {
+  @ApiProperty() totalSent!: number;
+  @ApiProperty() totalFailed!: number;
+  @ApiProperty() pendingRetries!: number;
+  @ApiPropertyOptional() lastDeliveryAt?: string;
+  @ApiPropertyOptional() lastError?: string;
+}
+
+export class RedeliverWebhookDto {
+  @ApiProperty({
+    description: "The event ID to redeliver",
+    example: "tx_abc123",
+  })
+  @IsString()
+  eventId!: string;
+
+  @ApiProperty({
+    description: "The event type to redeliver",
+    enum: WEBHOOK_EVENTS,
+    example: "payment.received",
+  })
+  @IsIn(WEBHOOK_EVENTS)
+  eventType!: string;
+}
+
+export class WebhookDeliveryStatusDto {
+  @ApiProperty() eventId!: string;
+  @ApiProperty() eventType!: string;
+  @ApiProperty({
+    description: "pending | sent | failed | dlq",
+  })
+  status!: string;
+  @ApiProperty() attempts!: number;
+  @ApiProperty() maxAttempts!: number;
+  @ApiPropertyOptional() lastError?: string;
+  @ApiPropertyOptional({
+    description: "Reason the delivery was moved to DLQ (last error when exhausted)",
+  })
+  dlqReason?: string;
+  @ApiPropertyOptional({
+    description: "Scheduled automatic retry time (ISO-8601) when status is failed",
+  })
+  nextRetryAt?: string;
+  @ApiPropertyOptional() httpStatus?: number;
+  @ApiPropertyOptional() responseBody?: string;
+  @ApiProperty() createdAt!: string;
+  @ApiProperty() updatedAt!: string;
+  @ApiPropertyOptional() deliveredAt?: string;
+  @ApiProperty({
+    description: "Count of manual replay API calls for this event",
+  })
+  replayCount!: number;
+  @ApiPropertyOptional() lastReplayAt?: string;
+}
+
+export class WebhookReplayLogDto {
+  @ApiProperty() id!: string;
+  @ApiProperty() eventType!: string;
+  @ApiProperty() eventId!: string;
+  @ApiProperty() status!: string;
+  @ApiPropertyOptional() reason?: string;
+  @ApiProperty() triggeredBy!: string;
+  @ApiPropertyOptional() deliverySuccess?: boolean;
+  @ApiProperty() createdAt!: string;
+}
+
+export class WebhookRedeliverResponseDto {
+  @ApiProperty() queued!: boolean;
+  @ApiProperty() message!: string;
+  @ApiPropertyOptional() replayId?: string;
+  @ApiPropertyOptional() deliverySuccess?: boolean;
+}
+
+export class VerifyWebhookSignatureDto {
+  @ApiProperty({
+    description:
+      "Raw JSON payload string exactly as it would be sent in the webhook body",
+    example: '{"eventType":"payment.received","eventId":"tx_abc123"}',
+  })
+  @IsString()
+  @IsNotEmpty()
+  payload!: string;
+
+  @ApiProperty({
+    description: "Value of the X-QuickEx-Signature header, e.g. sha256=<hex>",
+    example: "sha256=5d41402abc4b2a76b9719d911017c592",
+  })
+  @IsString()
+  @IsNotEmpty()
+  signature!: string;
+
+  @ApiProperty({
+    description: "Value of the X-QuickEx-Timestamp header (ISO-8601)",
+    example: "2026-07-10T12:00:00.000Z",
+  })
+  @IsString()
+  @IsNotEmpty()
+  timestamp!: string;
+
+  @ApiProperty({
+    description: "The webhook secret to verify against",
+    example: "whsec_mysecretkey123",
+  })
+  @IsString()
+  @IsNotEmpty()
+  secret!: string;
+}
+
+export class VerifyWebhookSignatureResponseDto {
+  @ApiProperty() valid!: boolean;
+  @ApiProperty({
+    description:
+      "VALID | MISSING_FIELDS | INVALID_SIGNATURE_FORMAT | INVALID_TIMESTAMP | TIMESTAMP_OUT_OF_TOLERANCE | SIGNATURE_MISMATCH",
+  })
+  reason!: string;
+}
+
+/**
+ * Rotation result (issue #277). `previousSecretExpiresAt` is present only when
+ * an overlap window was granted; the previous secret is never returned, only
+ * the instant it stops being accepted.
+ */
+export class RegenerateWebhookSecretResponseDto {
+  @ApiProperty({
+    description: "New signing secret. Used for every subsequent delivery.",
+    example: "whsec_xxxxxxxxxxxxxxxx",
+  })
+  secret!: string;
+  @ApiPropertyOptional({
+    description:
+      "ISO-8601 instant until which the previous secret is still accepted for " +
+      "verification. Absent when the rotation had no overlap window.",
+  })
+  previousSecretExpiresAt?: string;
+}

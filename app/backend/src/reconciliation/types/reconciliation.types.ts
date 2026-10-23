@@ -45,6 +45,7 @@ export interface EscrowRecord {
   contract_address: string;  // Stellar account ID acting as escrow
   status: EscrowDbStatus;
   amount: string;
+  /** Stellar asset identity: XLM or an issued asset as CODE:ISSUER. */
   asset: string;
   from_address: string;
   to_address: string;
@@ -92,6 +93,35 @@ export interface PaymentReconciliationResult {
   irreconcilableReason?: string;
 }
 
+export type DivergenceEntity = 'escrow' | 'payment';
+export type DivergenceType =
+  | 'missing'
+  | 'duplicate'
+  | 'amount_mismatch'
+  | 'status_mismatch'
+  | 'extra_on_chain';
+
+export interface DivergenceRecord {
+  entity: DivergenceEntity;
+  type: DivergenceType;
+  id?: string;
+  contractAddress?: string;
+  txHash?: string;
+  expectedAmount?: string;
+  observedAmount?: string;
+  expectedStatus?: string;
+  observedStatus?: string;
+  details: string;
+}
+
+export interface ReconciliationMetrics {
+  divergence_rate: number;
+  auto_match_rate: number;
+  total_divergences: number;
+  auto_matched: number;
+  reviewed: number;
+}
+
 export enum ReconciliationAction {
   /** DB and chain agree — no change needed. */
   NoOp = 'no_op',
@@ -124,5 +154,37 @@ export interface ReconciliationReport {
     skipped: number;
     irreconcilable: number;
     results: PaymentReconciliationResult[];
+  };
+  divergences?: DivergenceRecord[];
+  metrics?: ReconciliationMetrics;
+  divergence_rate?: number;
+  auto_match_rate?: number;
+  /** Comparison of expected vs observed totals for discrepancy detection */
+  totalsComparison?: {
+    payments: {
+      expectedCount: number;
+      observedCount: number;
+      countDiscrepancy: number;
+      expectedTotalAmount: string;
+      observedTotalAmount: string;
+      amountDiscrepancy: string;
+      amountMismatchCount: number;
+      unresolvedCount: number;
+      complete: boolean;
+      exceedsThreshold: boolean;
+      assets: Record<string, {
+        expectedCount: number;
+        observedCount: number;
+        expectedTotalAmount: string;
+        observedTotalAmount: string;
+        amountDiscrepancy: string;
+      }>;
+    };
+  };
+  /** Alert if discrepancies exceed configured threshold */
+  alert?: {
+    severity: 'warning' | 'critical';
+    message: string;
+    details: string;
   };
 }

@@ -3,11 +3,17 @@ import {
   Controller,
   Get,
   Post,
+  Patch,
   Query,
+  Param,
+  Headers,
   ConflictException,
   BadRequestException,
   ForbiddenException,
+  NotFoundException,
+  ServiceUnavailableException,
 } from "@nestjs/common";
+import { Throttle } from "@nestjs/throttler";
 import {
   ApiBody,
   ApiOperation,
@@ -19,15 +25,34 @@ import { EventEmitter2 } from "@nestjs/event-emitter";
 
 import {
   CreateUsernameDto,
+  ClaimUsernameDto,
   CreateUsernameResponseDto,
   ListUsernamesQueryDto,
   ListUsernamesResponseDto,
+  SearchUsernamesQueryDto,
+  SearchUsernamesResponseDto,
+  TrendingCreatorsQueryDto,
+  TrendingCreatorsResponseDto,
+  RecentlyActiveQueryDto,
+  RecentlyActiveResponseDto,
+  FeaturedUsernamesQueryDto,
+  FeaturedUsernamesResponseDto,
+  PublicProfileDto,
+  ProfileSettingsDto,
+  UpdateVisibilityDto,
+  AnnounceKeyRotationDto,
+  RevokeKeyRotationDto,
 } from "../dto";
 import { UsernamesService } from "./usernames.service";
 import {
   UsernameConflictError,
   UsernameLimitExceededError,
   UsernameValidationError,
+  UsernameErrorCode,
+  UsernameClaimInvalidError,
+  KeyRotationDisabledError,
+  KeyRotationNotFoundError,
+  KeyRotationConflictError,
 } from "./errors";
 
 @ApiTags("usernames")
@@ -38,7 +63,52 @@ export class UsernamesController {
     private readonly eventEmitter: EventEmitter2,
   ) {}
 
+  @Post("claim")
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @ApiOperation({
+    summary: "Claim a username with an on-chain verified signature",
+    description:
+      "The signature must be <unix milliseconds>.<base64 signature> over " +
+      "QuickEx username claim\\n<normalized username>\\n<timestamp>.",
+  })
+  @ApiBody({ type: ClaimUsernameDto })
+  @ApiResponse({ status: 201, description: "Username claimed successfully" })
+  @ApiResponse({ status: 400, description: "Invalid claim signature" })
+  @ApiResponse({ status: 409, description: "Username already taken" })
+  async claimUsername(@Body() body: ClaimUsernameDto): Promise<CreateUsernameResponseDto> {
+    try {
+      await this.usernamesService.verifyAndCreateClaim(
+        body.username,
+        body.signature,
+        body.publicKey,
+      );
+    } catch (err) {
+      if (err instanceof UsernameConflictError) {
+        throw new ConflictException({ code: "USERNAME_CONFLICT", message: err.message });
+      }
+      if (err instanceof UsernameLimitExceededError) {
+        throw new ForbiddenException({ code: "USERNAME_LIMIT_EXCEEDED", message: err.message });
+      }
+      if (err instanceof UsernameClaimInvalidError) {
+        throw new BadRequestException({ code: UsernameErrorCode.CLAIM_INVALID, message: err.message });
+      }
+      if (err instanceof UsernameValidationError) {
+        throw new BadRequestException({ code: err.code, message: err.message, field: err.field });
+      }
+      throw err;
+    }
+
+    this.eventEmitter.emit("username.claimed", {
+      username: body.username,
+      publicKey: body.publicKey,
+      timestamp: new Date().toISOString(),
+    });
+
+    return { ok: true };
+  }
+
   @Post()
+  @Throttle({ default: { limit: 10, ttl: 60000 } }) // 10 requests per minute
   @ApiOperation({
     summary: "Create a new username",
     description:
@@ -66,6 +136,10 @@ export class UsernamesController {
   @ApiResponse({
     status: 403,
     description: "Wallet has reached the maximum allowed usernames",
+  })
+  @ApiResponse({
+    status: 429,
+    description: "Rate limit exceeded – retry after 60 seconds",
   })
   async createUsername(
     @Body() body: CreateUsernameDto,
@@ -131,5 +205,451 @@ export class UsernamesController {
       query.publicKey,
     );
     return { usernames };
+  }
+
+  @Get("profile")
+  @ApiOperation({ summary: "Get editable profile settings for a wallet" })
+  @ApiResponse({ status: 200, description: "Profile settings owned by the wallet" })
+  async getProfileSettings(
+    @Query() query: ListUsernamesQueryDto,
+  ) {
+    const profiles = await this.usernamesService.getProfileSettings(query.publicKey);
+    return { profiles };
+  }
+
+  @Patch("profile")
+  @ApiOperation({ summary: "Save validated profile settings with conflict detection" })
+  @ApiBody({ type: ProfileSettingsDto })
+  @ApiResponse({ status: 200, description: "Profile settings saved" })
+  @ApiResponse({ status: 400, description: "Profile payload failed validation" })
+  @ApiResponse({ status: 403, description: "Profile is not owned by this wallet" })
+  @ApiResponse({ status: 409, description: "Profile changed since it was loaded" })
+  @ApiResponse({ status: 503, description: "A required dependency is unavailable" })
+  async updateProfileSettings(
+    @Body() body: ProfileSettingsDto,
+    @Headers("idempotency-key") idempotencyKey?: string,
+  ) {
+    let result: Awaited<ReturnType<UsernamesService["updateProfileSettings"]>>;
+    try {
+      result = await this.usernamesService.updateProfileSettings(
+        body,
+        idempotencyKey,
+      );
+    } catch (err) {
+      if (err instanceof UsernameValidationError) {
+        throw new BadRequestException({
+          code: "PROFILE_MALFORMED",
+          message: err.message,
+          field: err.field,
+        });
+      }
+      if (err instanceof UsernameConflictError) {
+        throw new ConflictException({
+          code: "PROFILE_CONFLICT",
+          message: err.message,
+        });
+      }
+      throw new ServiceUnavailableException({
+        code: "PROFILE_DEPENDENCY_FAILURE",
+        message: "Profile settings could not be saved due to a dependency failure",
+      });
+    }
+
+    if (result.status === "not_found") {
+      throw new ForbiddenException({
+        code: "PROFILE_NOT_OWNED",
+        message: "Profile not found for this wallet",
+      });
+    }
+    if (result.status === "conflict") {
+      throw new ConflictException({
+        code: "PROFILE_CONFLICT",
+        message: "Profile changed since it was loaded",
+      });
+    }
+    if (result.status === "malformed") {
+      throw new BadRequestException({
+        code: "PROFILE_MALFORMED",
+        message: "Profile payload failed validation",
+      });
+    }
+    if (result.status === "dependency_failure") {
+      throw new ServiceUnavailableException({
+        code: "PROFILE_DEPENDENCY_FAILURE",
+        message: "Profile settings could not be saved due to a dependency failure",
+      });
+    }
+    return { profile: result.profile };
+  }
+
+  @Get("search")
+  @Throttle({ default: { limit: 20, ttl: 60000 } }) // 20 requests per minute
+  @ApiOperation({
+    summary: "Search public profiles",
+    description:
+      "Fuzzy search for public usernames. Returns profiles sorted by similarity score. " +
+      'Only profiles with "Public Profile" enabled will appear in search results.',
+  })
+  @ApiQuery({
+    name: "query",
+    description: "Search query for fuzzy matching (min 2 characters)",
+    required: true,
+    example: "alice",
+  })
+  @ApiQuery({
+    name: "limit",
+    description: "Maximum number of results (1-100)",
+    required: false,
+    example: 10,
+  })
+  @ApiResponse({
+    status: 200,
+    description: "List of public profiles matching the search query",
+    type: SearchUsernamesResponseDto,
+  })
+  @ApiResponse({
+    status: 400,
+    description: "Invalid search query",
+  })
+  @ApiResponse({
+    status: 429,
+    description: "Rate limit exceeded – retry after 60 seconds",
+  })
+  @ApiResponse({
+    status: 503,
+    description: "Search service temporarily unavailable",
+  })
+  async searchUsernames(
+    @Query() query: SearchUsernamesQueryDto,
+  ): Promise<SearchUsernamesResponseDto> {
+    const results = await this.usernamesService.searchDiscovery(
+      query.query,
+      query.limit,
+      query.cursor,
+    );
+
+    const profileResults = results.results.filter((r) => r.kind === "profile") as Array<{
+      kind: "profile"; id: string; username: string; publicKey?: string; similarityScore?: number; lastActiveAt?: string; createdAt: string;
+    }>;
+
+    return {
+      results: results.results,
+      profiles: profileResults.map((r) => ({
+        id: r.id,
+        username: r.username,
+        publicKey: r.publicKey ?? "",
+        lastActiveAt: r.lastActiveAt || r.createdAt,
+        createdAt: r.createdAt,
+        similarityScore: r.similarityScore,
+      })) as PublicProfileDto[],
+      empty: results.empty,
+      total: results.total,
+      next_cursor: results.next_cursor,
+      has_more: results.has_more,
+    };
+  }
+
+  @Get("trending")
+  @Throttle({ default: { limit: 10, ttl: 60000 } }) // 10 requests per minute
+  @ApiOperation({
+    summary: "Get trending creators",
+    description:
+      "Returns trending creator profiles based on transaction volume. " +
+      "Ranking is calculated from recent payment activity within the specified time window.",
+  })
+  @ApiQuery({
+    name: "timeWindowHours",
+    description: "Time window in hours for trending calculation (1-720)",
+    required: false,
+    example: 24,
+  })
+  @ApiQuery({
+    name: "limit",
+    description: "Maximum number of trending creators (1-100)",
+    required: false,
+    example: 10,
+  })
+  @ApiResponse({
+    status: 200,
+    description: "List of trending creator profiles sorted by volume",
+    type: TrendingCreatorsResponseDto,
+  })
+  @ApiResponse({
+    status: 400,
+    description: "Invalid time window parameter",
+  })
+  @ApiResponse({
+    status: 429,
+    description: "Rate limit exceeded – retry after 60 seconds",
+  })
+  @ApiResponse({
+    status: 503,
+    description: "Trending service temporarily unavailable",
+  })
+  async getTrendingCreators(
+    @Query() query: TrendingCreatorsQueryDto,
+  ): Promise<TrendingCreatorsResponseDto> {
+    const creators = await this.usernamesService.getTrendingCreators(
+      query.timeWindowHours,
+      query.limit,
+      query.cursor,
+    );
+
+    return {
+      creators: creators.data.map((c) => ({
+        id: c.id,
+        username: c.username,
+        publicKey: c.public_key,
+        lastActiveAt: c.last_active_at || c.created_at,
+        createdAt: c.created_at,
+        transactionVolume: c.transaction_volume,
+        transactionCount: c.transaction_count,
+      })) as PublicProfileDto[],
+      timeWindowHours: query.timeWindowHours,
+      calculatedAt: new Date().toISOString(),
+      next_cursor: creators.next_cursor,
+      has_more: creators.has_more,
+    };
+  }
+
+  @Get("recently-active")
+  @Throttle({ default: { limit: 10, ttl: 60000 } }) // 10 requests per minute
+  @ApiOperation({
+    summary: "Get recently active users",
+    description:
+      "Returns users who have been recently active based on payment activity. " +
+      "Users are sorted by their most recent transaction or profile activity.",
+  })
+  @ApiQuery({
+    name: "timeWindowHours",
+    description:
+      "Time window in hours to consider users as recently active (1-168)",
+    required: false,
+    example: 24,
+  })
+  @ApiQuery({
+    name: "limit",
+    description: "Maximum number of recently active users (1-100)",
+    required: false,
+    example: 10,
+  })
+  @ApiResponse({
+    status: 200,
+    description:
+      "List of recently active public profiles sorted by last activity",
+    type: RecentlyActiveResponseDto,
+  })
+  @ApiResponse({
+    status: 400,
+    description: "Invalid time window parameter",
+  })
+  @ApiResponse({
+    status: 429,
+    description: "Rate limit exceeded – retry after 60 seconds",
+  })
+  @ApiResponse({
+    status: 503,
+    description: "Recently active service temporarily unavailable",
+  })
+  async getRecentlyActive(
+    @Query() query: RecentlyActiveQueryDto,
+  ): Promise<RecentlyActiveResponseDto> {
+    const users = await this.usernamesService.getRecentlyActiveUsers(
+      query.timeWindowHours,
+      query.limit,
+      query.cursor,
+    );
+
+    return {
+      users: users.data.map((u) => ({
+        id: u.id,
+        username: u.username,
+        publicKey: u.public_key,
+        lastActiveAt: u.last_active_at || u.created_at,
+        createdAt: u.created_at,
+      })) as PublicProfileDto[],
+      timeWindowHours: query.timeWindowHours,
+      calculatedAt: new Date().toISOString(),
+      next_cursor: users.next_cursor,
+      has_more: users.has_more,
+    };
+  }
+
+  @Get("featured")
+  @Throttle({ default: { limit: 10, ttl: 60000 } }) // 10 requests per minute
+  @ApiOperation({
+    summary: "Get featured creators",
+    description:
+      "Returns curated/featured creator profiles for discovery, ordered by " +
+      "manual featured rank (lower rank shows first).",
+  })
+  @ApiQuery({
+    name: "limit",
+    description: "Maximum number of featured creators (1-100)",
+    required: false,
+    example: 10,
+  })
+  @ApiQuery({
+    name: "cursor",
+    description: "Opaque cursor for the next page of results",
+    required: false,
+  })
+  @ApiResponse({
+    status: 200,
+    description: "List of featured creator profiles sorted by featured rank",
+    type: FeaturedUsernamesResponseDto,
+  })
+  @ApiResponse({
+    status: 429,
+    description: "Rate limit exceeded – retry after 60 seconds",
+  })
+  @ApiResponse({
+    status: 503,
+    description: "Featured service temporarily unavailable",
+  })
+  async getFeaturedCreators(
+    @Query() query: FeaturedUsernamesQueryDto,
+  ): Promise<FeaturedUsernamesResponseDto> {
+    const creators = await this.usernamesService.getFeaturedCreators(
+      query.limit,
+      query.cursor,
+    );
+
+    return {
+      profiles: creators.data.map((c) => ({
+        id: c.id,
+        username: c.username,
+        publicKey: c.public_key,
+        lastActiveAt: c.last_active_at || c.created_at,
+        createdAt: c.created_at,
+        featuredRank: c.featured_rank,
+      })) as PublicProfileDto[],
+      next_cursor: creators.next_cursor,
+      has_more: creators.has_more,
+    };
+  }
+
+  @Post("toggle-public")
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @ApiOperation({
+    summary: "Toggle public profile visibility",
+    description:
+      "Enable or disable public profile visibility for a username. " +
+      "Only the wallet owner can toggle their profile visibility.",
+  })
+  @ApiBody({
+    schema: {
+      type: "object",
+      properties: {
+        username: { type: "string", example: "alice" },
+        publicKey: {
+          type: "string",
+          example: "GBXGQ55JMQ4L2B6E7S8Y9Z0A1B2C3D4E5F6G7H8I7YWR",
+        },
+        isPublic: { type: "boolean", example: true },
+      },
+      required: ["username", "publicKey", "isPublic"],
+    },
+  })
+  @ApiResponse({
+    status: 200,
+    description: "Public profile visibility toggled successfully",
+  })
+  @ApiResponse({
+    status: 404,
+    description: "Username not found or does not belong to this wallet",
+  })
+  @ApiResponse({
+    status: 400,
+    description: "Invalid username format",
+  })
+  async togglePublicProfile(
+    @Body() body: { username: string; publicKey: string; isPublic: boolean },
+  ): Promise<{ ok: boolean }> {
+    try {
+      await this.usernamesService.togglePublicProfile(
+        body.username,
+        body.publicKey,
+        body.isPublic,
+      );
+      return { ok: true };
+    } catch (err) {
+      if (err instanceof UsernameValidationError) {
+        if (err.code === UsernameErrorCode.NOT_FOUND) {
+          throw new NotFoundException({
+            code: UsernameErrorCode.NOT_FOUND,
+            message: err.message,
+          });
+        }
+        throw new BadRequestException({
+          code: err.code,
+          message: err.message,
+        });
+      }
+      throw err;
+    }
+  }
+
+  // NOTE: This catch-all route MUST remain the last @Get route declared in this
+  // controller. The discovery routes above (search, trending, recently-active,
+  // featured) would otherwise be shadowed by ":username".
+  @Get(":username")
+  @ApiOperation({
+    summary: "Get profile by username",
+    description: "Returns profile details for a given username. " +
+      "If the profile is private, returns a privacy-aware response.",
+  })
+  @ApiResponse({
+    status: 200,
+    description: "Profile details",
+  })
+  @ApiResponse({
+    status: 404,
+    description: "Username not found",
+  })
+  @ApiResponse({
+    status: 429,
+    description: "Rate limit exceeded – retry after 60 seconds",
+  })
+  @ApiResponse({
+    status: 503,
+    description: "Profile service temporarily unavailable",
+  })
+  async getProfile(
+    @Param("username") username: string,
+  ) {
+    try {
+      const profile = await this.usernamesService.getProfileByUsername(username);
+      if (!profile.is_public) {
+        return {
+          username: profile.username,
+          isPublic: false,
+          visibility: profile.visibility,
+        };
+      }
+      return {
+        id: profile.id,
+        username: profile.username,
+        publicKey: profile.public_key,
+        isPublic: true,
+        visibility: profile.visibility,
+        lastActiveAt: profile.last_active_at || profile.created_at,
+        createdAt: profile.created_at,
+      };
+    } catch (err) {
+      if (err instanceof UsernameValidationError) {
+        if (err.code === UsernameErrorCode.NOT_FOUND) {
+          throw new NotFoundException({
+            code: UsernameErrorCode.NOT_FOUND,
+            message: err.message,
+          });
+        }
+        throw new BadRequestException({
+          code: err.code,
+          message: err.message,
+        });
+      }
+      throw err;
+    }
   }
 }

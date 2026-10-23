@@ -106,10 +106,10 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "Escrow"
+                  "symbol": "EscrowCore"
                 },
                 {
-                  "bytes": "b68a06e10b7cf6eed01e59179ddc37c97ae4d11985c697b33bb0e2bb9158ddab"
+                  "bytes": "4c14daa4527452b95c9f634fdc93ce566fee2ab18ab2a7e149182d830a51ffe2"
                 }
               ]
             },
@@ -126,10 +126,10 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "Escrow"
+                      "symbol": "EscrowCore"
                     },
                     {
-                      "bytes": "b68a06e10b7cf6eed01e59179ddc37c97ae4d11985c697b33bb0e2bb9158ddab"
+                      "bytes": "4c14daa4527452b95c9f634fdc93ce566fee2ab18ab2a7e149182d830a51ffe2"
                     }
                   ]
                 },
@@ -138,7 +138,15 @@
                   "map": [
                     {
                       "key": {
-                        "symbol": "amount"
+                        "symbol": "amount_due"
+                      },
+                      "val": {
+                        "i128": "1000000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "amount_paid"
                       },
                       "val": {
                         "i128": "1000000"
@@ -194,7 +202,7 @@
             },
             "ext": "v0"
           },
-          4095
+          3110400
         ]
       ],
       [

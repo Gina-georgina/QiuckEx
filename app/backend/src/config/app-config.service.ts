@@ -1,7 +1,18 @@
-import { Injectable } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
+import { Injectable } from "@nestjs/common";
+import { ConfigService } from "@nestjs/config";
 
-import { EnvConfig } from './env.schema';
+import { EnvConfig } from "./env.schema";
+import { RateLimitProfileName } from "./rate-limit.config";
+
+export type RateLimitEnvOverrides = {
+  public: Partial<{ burst: number; burstTtlMs: number; sustained: number; sustainedTtlMs: number }>;
+  authenticated: Partial<{ burst: number; burstTtlMs: number; sustained: number; sustainedTtlMs: number }>;
+  webhooks: Partial<{ burst: number; burstTtlMs: number; sustained: number; sustainedTtlMs: number }>;
+  keyOrder: string;
+  allowlistCidrs: string;
+  allowlistApiKeys: string;
+  allowlistUserIds: string;
+};
 
 /**
  * Typed configuration service with centralized accessors for environment variables.
@@ -11,94 +22,506 @@ import { EnvConfig } from './env.schema';
 export class AppConfigService {
   constructor(private readonly configService: ConfigService<EnvConfig, true>) {}
 
+  getBootstrapBase() {
+    return {
+      network: {
+        environment: this.network,
+        rpcUrl: this.sorobanRpcUrl || "",
+        horizonUrl: this.horizonUrl || "",
+        networkPassphrase: this.stellarNetworkPassphrase,
+      },
+      contracts: {
+        registryId: this.quickexContractId || "",
+        routerId: this.routerContractId || "",
+        allowedTokens: this.allowedTokens,
+      },
+      backendMetadata: {
+        version: this.appVersion,
+        apiUrl: this.apiBaseUrl,
+      },
+    };
+  }
+
   /**
    * Get the server port
    */
   get port(): number {
-    return this.configService.get('PORT', { infer: true });
+    return this.configService.get("PORT", { infer: true });
   }
 
   /**
    * Get the Stellar network (testnet or mainnet)
    */
-  get network(): 'testnet' | 'mainnet' {
-    return this.configService.get('NETWORK', { infer: true });
+  get network(): "testnet" | "mainnet" {
+    return this.configService.get("NETWORK", { infer: true });
+  }
+
+  get contractRegistryManifestPublicKeys(): Record<string, string> {
+    const raw = this.configService.get("CONTRACT_REGISTRY_MANIFEST_PUBLIC_KEYS", { infer: true });
+    if (!raw) return {};
+    return JSON.parse(raw) as Record<string, string>;
   }
 
   /**
    * Get the Supabase URL
    */
   get supabaseUrl(): string {
-    return this.configService.get('SUPABASE_URL', { infer: true });
+    return this.configService.get("SUPABASE_URL", { infer: true });
   }
 
   /**
    * Get the Supabase anonymous key
    */
   get supabaseAnonKey(): string {
-    return this.configService.get('SUPABASE_ANON_KEY', { infer: true });
+    return this.configService.get("SUPABASE_ANON_KEY", { infer: true });
   }
 
   /**
    * Get the Node environment
    */
-  get nodeEnv(): 'development' | 'production' | 'test' {
-    return this.configService.get('NODE_ENV', { infer: true });
+  get nodeEnv(): "development" | "production" | "test" {
+    return this.configService.get("NODE_ENV", { infer: true });
   }
 
   /**
    * Check if running in development mode
    */
   get isDevelopment(): boolean {
-    return this.nodeEnv === 'development';
+    return this.nodeEnv === "development";
   }
 
   /**
    * Check if running in production mode
    */
   get isProduction(): boolean {
-    return this.nodeEnv === 'production';
+    return this.nodeEnv === "production";
+  }
+
+  /**
+   * Get the explicit environment name
+   */
+  get environmentName():
+    | "development"
+    | "staging"
+    | "production"
+    | "test"
+    | undefined {
+    return this.configService.get("ENVIRONMENT_NAME", { infer: true });
+  }
+
+  /**
+   * Check if running in staging environment
+   */
+  get isStaging(): boolean {
+    return this.environmentName === "staging";
+  }
+
+  /**
+   * Environment parity check configuration
+   */
+  get envParityCheckEnabled(): boolean {
+    return this.configService.get("ENV_PARITY_CHECK_ENABLED", { infer: true });
+  }
+
+  /**
+   * Production base URL for parity comparison
+   */
+  get productionBaseUrl(): string | undefined {
+    return this.configService.get("PRODUCTION_BASE_URL", { infer: true });
+  }
+
+  /**
+   * Shadow traffic configuration
+   */
+  get shadowTrafficEnabled(): boolean {
+    return this.configService.get("SHADOW_TRAFFIC_ENABLED", { infer: true });
+  }
+
+  /**
+   * Shadow traffic sample rate (0.0 to 1.0)
+   */
+  get shadowTrafficSampleRate(): number {
+    return this.configService.get("SHADOW_TRAFFIC_SAMPLE_RATE", {
+      infer: true,
+    });
+  }
+
+  /**
+   * Comma-separated list of endpoints to shadow
+   */
+  get shadowTrafficEndpoints(): string {
+    return this.configService.get("SHADOW_TRAFFIC_ENDPOINTS", { infer: true });
+  }
+
+  /**
+   * Check if staging data seeding is enabled
+   */
+  get stagingSeedDataEnabled(): boolean {
+    return this.configService.get("STAGING_SEED_DATA_ENABLED", { infer: true });
+  }
+
+  /**
+   * Public API base URL for client bootstrapping.
+   */
+  get publicApiUrl(): string | undefined {
+    return this.configService.get("PUBLIC_API_URL", { infer: true });
+  }
+
+  /**
+   * Parsed list of explicitly allowed CORS origins.
+   * Sourced from the CORS_ALLOWED_ORIGINS env var (comma-separated).
+   */
+  get corsAllowedOrigins(): string[] {
+    const raw = this.configService.get('CORS_ALLOWED_ORIGINS', { infer: true });
+    return raw ? raw.split(',').map((o) => o.trim()).filter(Boolean) : [];
+  }
+
+  /**
+   * Vercel project slug used to allow preview deployment URLs.
+   * When set, https://<slug>-*.vercel.app origins are permitted.
+   */
+  get corsVercelProject(): string | undefined {
+    return this.configService.get('CORS_VERCEL_PROJECT', { infer: true });
+  }
+
+  /**
+   * Contract method allowlist enforcement mode.
+   */
+  get contractMethodAllowlistMode(): "enforce" | "off" {
+    return this.configService.get("CONTRACT_METHOD_ALLOWLIST_MODE", {
+      infer: true,
+    });
+  }
+
+  /**
+   * Raw JSON string describing the contract method allowlist, or undefined if unset.
+   */
+  get contractMethodAllowlistJson(): string | undefined {
+    return this.configService.get("CONTRACT_METHOD_ALLOWLIST_JSON", {
+      infer: true,
+    });
   }
 
   /**
    * Check if running on testnet
    */
   get isTestnet(): boolean {
-    return this.network === 'testnet';
+    return this.network === "testnet";
   }
 
   /**
    * Check if running on mainnet
    */
   get isMainnet(): boolean {
-    return this.network === 'mainnet';
+    return this.network === "mainnet";
   }
 
   /**
    * Max usernames per wallet (optional). When not set, returns undefined (no limit).
    */
   get maxUsernamesPerWallet(): number | undefined {
-    return this.configService.get('MAX_USERNAMES_PER_WALLET', { infer: true });
+    return this.configService.get("MAX_USERNAMES_PER_WALLET", { infer: true });
   }
 
   /**
    * Maximum number of items to cache for transactions
    */
   get cacheMaxItems(): number {
-    return this.configService.get('CACHE_MAX_ITEMS', { infer: true });
+    return this.configService.get("CACHE_MAX_ITEMS", { infer: true });
   }
 
   /**
    * Cache TTL in milliseconds for transaction responses
    */
   get cacheTtlMs(): number {
-    return this.configService.get('CACHE_TTL_MS', { infer: true });
+    return this.configService.get("CACHE_TTL_MS", { infer: true });
+  }
+
+  get featureFlagsCacheTtlMs(): number {
+    return this.configService.get("FEATURE_FLAGS_CACHE_TTL_MS", {
+      infer: true,
+    });
+  }
+
+  get featureFlagsBootstrapJson(): string | undefined {
+    return this.configService.get("FEATURE_FLAGS_BOOTSTRAP_JSON", {
+      infer: true,
+    });
   }
 
   /**
    * Max records processed per entity type per reconciliation run
    */
   get reconciliationBatchSize(): number {
-    return this.configService.get('RECONCILIATION_BATCH_SIZE', { infer: true });
+    return this.configService.get("RECONCILIATION_BATCH_SIZE", { infer: true });
+  }
+
+  /**
+   * QuickEx Soroban contract id (optional). Used for ingestion and soroban preflight.
+   */
+  get quickexContractId(): string | undefined {
+    return this.configService.get("QUICKEX_CONTRACT_ID", { infer: true });
+  }
+
+  /**
+   * Sentry DSN for error reporting. Undefined means Sentry is disabled.
+   */
+  get sentryDsn(): string | undefined {
+    return this.configService.get("SENTRY_DSN", { infer: true });
+  }
+
+  /**
+   * Redis connection URL (optional). Absent/empty disables Redis-backed features,
+   * which then fall back to in-memory stores.
+   */
+  get redisUrl(): string | undefined {
+    return this.configService.get("REDIS_URL", { infer: true });
+  }
+
+  /**
+   * Retention TTL (ms) for the last successful analytics report, served when the
+   * data source is unavailable. Defaults to 5 minutes.
+   */
+  get analyticsStaleCacheTtlMs(): number {
+    return this.configService.get("ANALYTICS_STALE_CACHE_TTL_MS", {
+      infer: true,
+    });
+  }
+
+  /**
+   * Supabase service role key (optional). Used for admin database operations.
+   */
+  get supabaseServiceRoleKey(): string | undefined {
+    return this.configService.get("SUPABASE_SERVICE_ROLE_KEY", { infer: true });
+  }
+
+  /**
+   * Custom Horizon URL (optional). Overrides network default if provided.
+   */
+  get horizonUrl(): string | undefined {
+    return this.configService.get("HORIZON_URL", { infer: true });
+  }
+
+  get sorobanRpcUrl(): string | undefined {
+    return this.configService.get("SOROBAN_RPC_URL", { infer: true });
+  }
+
+  get stellarExplorerUrl(): string | undefined {
+    return this.configService.get("STELLAR_EXPLORER_URL", { infer: true });
+  }
+
+  /**
+   * Stellar secret key (optional). Required for signing transactions.
+   */
+  get stellarSecretKey(): string | undefined {
+    return this.configService.get("STELLAR_SECRET_KEY", { infer: true });
+  }
+
+  /**
+   * Stellar public key (optional). The public key corresponding to the secret key.
+   */
+  get stellarPublicKey(): string | undefined {
+    return this.configService.get("STELLAR_PUBLIC_KEY", { infer: true });
+  }
+
+  /**
+   * Check if payment signing is configured (has secret key)
+   */
+  get isPaymentSigningConfigured(): boolean {
+    return !!this.stellarSecretKey;
+  }
+
+  /**
+   * Indexer lag threshold in ledgers
+   */
+  get indexerLagThresholdLedgers(): number {
+    return this.configService.get("INDEXER_LAG_THRESHOLD_LEDGERS", { infer: true });
+  }
+
+  /**
+   * Whether the indexer lag guard is enabled
+   */
+  get indexerLagGuardEnabled(): boolean {
+    return this.configService.get("INDEXER_LAG_GUARD_ENABLED", { infer: true });
+  }
+
+  /**
+   * Admin override to disable lag guard temporarily
+   */
+  get indexerLagGuardOverride(): boolean {
+    return this.configService.get("INDEXER_LAG_GUARD_OVERRIDE", { infer: true });
+  }
+
+  /**
+   * Days to retain abuse signals before auto-pruning
+   */
+  get abuseSignalRetentionDays(): number {
+    return this.configService.get("ABUSE_SIGNAL_RETENTION_DAYS", {
+      infer: true,
+    });
+  }
+
+  /**
+   * Abuse score threshold for flagging as suspicious (0-100)
+   */
+  get abuseSignalScoreThreshold(): number {
+    return this.configService.get("ABUSE_SIGNAL_SCORE_THRESHOLD", {
+      infer: true,
+    });
+  }
+
+  /**
+   * Enable geo-lite lookups for abuse signals
+   */
+  get abuseSignalGeoEnabled(): boolean {
+    return this.configService.get("ABUSE_SIGNAL_GEO_ENABLED", {
+      infer: true,
+    });
+  }
+
+  /**
+   * Salt for IP/UA hashing in abuse signals
+   */
+  get abuseSignalHashSalt(): string {
+    return this.configService.get("ABUSE_SIGNAL_HASH_SALT", { infer: true });
+  }
+
+  get marketplaceRestrictedUsernames(): string[] {
+    return this.configService
+      .get("MARKETPLACE_RESTRICTED_USERNAMES", { infer: true })
+      .split(",")
+      .map((username) => username.trim().toLowerCase())
+      .filter(Boolean);
+  }
+
+  // ====================================================================
+  // NEW ACCESSORS FOR BOOTSTRAP PAYLOAD
+  // ====================================================================
+
+  /**
+   * Get the API base URL for frontend routing
+   */
+  get apiBaseUrl(): string {
+    return this.configService.get("API_BASE_URL", { infer: true }) || "http://localhost:3000";
+  }
+
+  /**
+   * Get the current application version
+   */
+  get appVersion(): string {
+    return this.configService.get("APP_VERSION", { infer: true }) || process.env.npm_package_version || "1.0.0";
+  }
+
+  /**
+   * Get the Router Contract ID
+   */
+  get routerContractId(): string | undefined {
+    return this.configService.get("ROUTER_CONTRACT_ID", { infer: true });
+  }
+
+  /**
+   * Get predefined allowed tokens
+   */
+  get allowedTokens(): string[] {
+    const raw = this.configService.get("ALLOWED_TOKENS", { infer: true });
+    return raw ? raw.split(",").map((t) => t.trim()).filter(Boolean) : [];
+  }
+
+  /**
+   * Get Stellar Network Passphrase
+   */
+  get stellarNetworkPassphrase(): string {
+    return (
+      this.configService.get("STELLAR_NETWORK_PASSPHRASE", { infer: true }) ||
+      (this.isTestnet
+        ? "Test SDF Network ; September 2015"
+        : "Public Global Stellar Network ; September 2015")
+    );
+  }
+
+  /**
+   * Whether the compatibility gate is enabled.
+   */
+  get compatibilityGateEnabled(): boolean {
+    return this.configService.get("COMPATIBILITY_GATE_ENABLED", { infer: true });
+  }
+
+  /**
+   * Compatibility gate enforcement mode.
+   */
+  get compatibilityGateMode(): "enforce" | "warn" | "off" {
+    return this.configService.get("COMPATIBILITY_GATE_MODE", { infer: true });
+  }
+
+  /**
+   * Raw JSON string describing the compatibility gate rules, or undefined if unset.
+   */
+  get compatibilityGateRulesJson(): string | undefined {
+    return this.configService.get("COMPATIBILITY_GATE_RULES_JSON", {
+      infer: true,
+    });
+  }
+
+  /**
+   * Active rate-limit profile. Resolved from an explicit PROFILE/RATE_LIMIT_PROFILE
+   * if provided, otherwise derived from the environment name / network so config
+   * can be selected purely through environment variables.
+   */
+  get rateLimitProfile(): RateLimitProfileName {
+    const explicit = this.configService.get<string>("RATE_LIMIT_PROFILE");
+    if (explicit) {
+      const normalized = explicit.trim().toLowerCase();
+      if (
+        normalized === "local" ||
+        normalized === "preview" ||
+        normalized === "staging" ||
+        normalized === "production" ||
+        normalized === "testnet"
+      ) {
+        return normalized;
+      }
+    }
+
+    const envName = this.configService.get<string>("ENVIRONMENT_NAME");
+    if (envName === "staging") return "staging";
+    if (envName === "production") return "production";
+
+    if (this.isProduction && envName !== "development") return "production";
+    if (this.isTestnet) return "testnet";
+
+    // Remaining dev-like environments default to the local profile.
+    return "local";
+  }
+
+  /**
+   * Per-profile env overrides for rate limiting. Each value is read live from
+   * the validated environment so it can be changed without a restart in dev.
+   */
+  get rateLimitOverrides(): RateLimitEnvOverrides {
+    const cfg = this.configService;
+    return {
+      public: {
+        burst: cfg.get("RATE_LIMIT_PUBLIC_BURST_LIMIT", { infer: true }),
+        burstTtlMs: cfg.get("RATE_LIMIT_PUBLIC_BURST_TTL_MS", { infer: true }),
+        sustained: cfg.get("RATE_LIMIT_PUBLIC_SUSTAINED_LIMIT", { infer: true }),
+        sustainedTtlMs: cfg.get("RATE_LIMIT_PUBLIC_SUSTAINED_TTL_MS", { infer: true }),
+      },
+      authenticated: {
+        burst: cfg.get("RATE_LIMIT_AUTHENTICATED_BURST_LIMIT", { infer: true }),
+        burstTtlMs: cfg.get("RATE_LIMIT_AUTHENTICATED_BURST_TTL_MS", { infer: true }),
+        sustained: cfg.get("RATE_LIMIT_AUTHENTICATED_SUSTAINED_LIMIT", { infer: true }),
+        sustainedTtlMs: cfg.get("RATE_LIMIT_AUTHENTICATED_SUSTAINED_TTL_MS", { infer: true }),
+      },
+      webhooks: {
+        burst: cfg.get("RATE_LIMIT_WEBHOOKS_BURST_LIMIT", { infer: true }),
+        burstTtlMs: cfg.get("RATE_LIMIT_WEBHOOKS_BURST_TTL_MS", { infer: true }),
+        sustained: cfg.get("RATE_LIMIT_WEBHOOKS_SUSTAINED_LIMIT", { infer: true }),
+        sustainedTtlMs: cfg.get("RATE_LIMIT_WEBHOOKS_SUSTAINED_TTL_MS", { infer: true }),
+      },
+      keyOrder: cfg.get("RATE_LIMIT_KEY_ORDER", { infer: true }),
+      allowlistCidrs: cfg.get("RATE_LIMIT_ALLOWLIST_CIDRS", { infer: true }) ?? "",
+      allowlistApiKeys: cfg.get("RATE_LIMIT_ALLOWLIST_API_KEYS", { infer: true }) ?? "",
+      allowlistUserIds: cfg.get("RATE_LIMIT_ALLOWLIST_USER_IDS", { infer: true }) ?? "",
+    };
   }
 }

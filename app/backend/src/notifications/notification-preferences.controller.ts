@@ -5,15 +5,21 @@ import {
   Delete,
   Body,
   Param,
+  Patch,
   HttpCode,
   HttpStatus,
   Logger,
+  Optional,
+  Req,
+  UnauthorizedException,
 } from "@nestjs/common";
+import { EventEmitter2 } from "@nestjs/event-emitter";
 import { ApiTags, ApiOperation, ApiResponse, ApiParam } from "@nestjs/swagger";
 
 import { NotificationPreferencesRepository } from "./notification-preferences.repository";
 import {
   UpsertNotificationPreferenceDto,
+  UpdateNotificationPreferencesDto,
   NotificationPreferenceResponseDto,
 } from "./dto/notification-preferences.dto";
 import type { NotificationChannel } from "./types/notification.types";
@@ -33,7 +39,44 @@ import type { NotificationChannel } from "./types/notification.types";
 export class NotificationPreferencesController {
   private readonly logger = new Logger(NotificationPreferencesController.name);
 
-  constructor(private readonly prefsRepo: NotificationPreferencesRepository) {}
+  constructor(
+    private readonly prefsRepo: NotificationPreferencesRepository,
+    @Optional() private readonly eventEmitter?: EventEmitter2,
+  ) {}
+
+  @Get()
+  @ApiOperation({ summary: "Get notification preferences for the current user" })
+  @ApiResponse({ status: 200, type: [NotificationPreferenceResponseDto] })
+  async getCurrentPreferences(@Req() request: { user?: { publicKey?: string } }) {
+    const preferences = await this.prefsRepo.getPreferences(this.publicKeyFrom(request));
+    return preferences.map(this.toResponse);
+  }
+
+  @Patch()
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: "Update notification preferences for the current user" })
+  @ApiResponse({ status: 200, type: [NotificationPreferenceResponseDto] })
+  async updateCurrentPreferences(
+    @Req() request: { user?: { publicKey?: string } },
+    @Body() dto: UpdateNotificationPreferencesDto,
+  ): Promise<NotificationPreferenceResponseDto[]> {
+    const publicKey = this.publicKeyFrom(request);
+    const preferences = await this.prefsRepo.updatePreferences(
+      publicKey,
+      dto.preferences.map((preference) => ({
+        ...preference,
+        minAmountStroops:
+          preference.minAmountStroops !== undefined
+            ? BigInt(preference.minAmountStroops)
+            : undefined,
+      })),
+    );
+    this.eventEmitter?.emit("notification.preference.updated", {
+      publicKey,
+      preferences,
+    });
+    return preferences.map(this.toResponse);
+  }
 
   /**
    * GET /notifications/preferences/:publicKey
@@ -74,6 +117,7 @@ export class NotificationPreferencesController {
       email: dto.email,
       pushToken: dto.pushToken,
       webhookUrl: dto.webhookUrl,
+      webhookSecret: dto.webhookSecret,
       events: dto.events ?? null,
       minAmountStroops:
         dto.minAmountStroops !== undefined
@@ -93,7 +137,7 @@ export class NotificationPreferencesController {
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: "Opt-out of a notification channel (soft disable)" })
   @ApiParam({ name: "publicKey", description: "Stellar public key (G...)" })
-  @ApiParam({ name: "channel", enum: ["email", "push", "webhook"] })
+  @ApiParam({ name: "channel", enum: ["email", "telegram", "push", "webhook"] })
   @ApiResponse({ status: 204, description: "Channel disabled" })
   async disableChannel(
     @Param("publicKey") publicKey: string,
@@ -112,6 +156,7 @@ export class NotificationPreferencesController {
     email?: string;
     pushToken?: string;
     webhookUrl?: string;
+    webhookSecret?: string;
     events: string[] | null;
     minAmountStroops: bigint;
     enabled: boolean;
@@ -123,9 +168,18 @@ export class NotificationPreferencesController {
     dto.email = pref.email;
     dto.pushToken = pref.pushToken;
     dto.webhookUrl = pref.webhookUrl;
+    dto.webhookSecret = pref.webhookSecret;
     dto.events = pref.events as NotificationPreferenceResponseDto["events"];
     dto.minAmountStroops = pref.minAmountStroops.toString();
     dto.enabled = pref.enabled;
     return dto;
+  }
+
+  private publicKeyFrom(request: { user?: { publicKey?: string } }): string {
+    const publicKey = request.user?.publicKey;
+    if (!publicKey) {
+      throw new UnauthorizedException("Authenticated public key is required");
+    }
+    return publicKey;
   }
 }

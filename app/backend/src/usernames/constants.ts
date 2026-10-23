@@ -26,3 +26,13 @@ export const USERNAME_DEFAULT_MAX_PER_WALLET = 0;
 /** Display name for the pattern (for error messages). */
 export const USERNAME_PATTERN_DESCRIPTION =
   'lowercase letters, numbers, and underscores only';
+
+/**
+ * Feature flag key gating the username discovery endpoints.
+ *
+ * The four discovery endpoints (search, suggestions, trending, recent) are
+ * disabled by default and only enabled when this flag is turned on via the
+ * existing feature-flags module. This keeps non-mainnet behavior disabled
+ * until the underlying migrations are verified.
+ */
+export const USERNAME_DISCOVERY_ENABLED = 'username_discovery_enabled';

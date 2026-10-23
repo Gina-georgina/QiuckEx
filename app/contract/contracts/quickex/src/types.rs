@@ -2,7 +2,34 @@
 //!
 //! See [`crate::storage`] for the storage schema and key layout.
 
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{contracttype, Address, BytesN, String, Vec};
+
+/// Maximum memo length (1024 bytes).
+pub const MAX_MEMO_LENGTH: u32 = 1024;
+
+/// Milestone tracking for partial payments.
+#[contracttype]
+#[derive(Clone)]
+pub struct Milestone {
+    /// Unique milestone identifier.
+    pub id: u32,
+    /// Description of the milestone.
+    pub description: String,
+    /// Amount required for this milestone.
+    pub amount: i128,
+    /// Whether this milestone has been completed.
+    pub completed: bool,
+}
+
+/// Memo attached to an escrow.
+#[contracttype]
+#[derive(Clone)]
+pub struct Memo {
+    /// The memo text (max 1024 bytes).
+    pub text: String,
+    /// Ledger timestamp when memo was set.
+    pub set_at: u64,
+}
 
 /// Escrow entry status.
 ///
@@ -12,11 +39,9 @@ use soroban_sdk::{contracttype, Address};
 /// [*] --> Pending  : deposit()
 /// Pending --> Spent    : withdraw(proof)  [current_time < expires_at]
 /// Pending --> Refunded : refund(owner)    [current_time >= expires_at]
+/// Pending --> Disputed : dispute()        [any participant with arbiter]
+/// Disputed --> Spent/Refunded : resolve_dispute() [arbiter decides]
 /// ```
-///
-/// - `Pending`:  Funds are escrowed, awaiting withdrawal or refund.
-/// - `Spent`:    Withdrawal completed successfully. Terminal state.
-/// - `Refunded`: Owner reclaimed funds after timeout. Terminal state.
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EscrowStatus {
@@ -26,35 +51,68 @@ pub enum EscrowStatus {
     /// equivalent to an escrow that has passed expiry but not yet been refunded.
     Expired,
     Refunded,
+    /// Funds are locked pending arbiter resolution.
+    Disputed,
+}
+
+/// Read-only refund eligibility result returned by a contract view.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RefundEligibilityReason {
+    Eligible,
+    CommitmentNotFound,
+    EscrowNotExpired,
+    AlreadySpent,
+    InvalidDisputeState,
+}
+
+/// Read-only refund eligibility result with a normalized boolean and reason.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RefundEligibility {
+    pub eligible: bool,
+    pub reason: RefundEligibilityReason,
 }
 
 /// Escrow entry structure.
 ///
 /// Stored under [`DataKey::Escrow`](crate::storage::DataKey::Escrow)(commitment) in persistent storage.
-/// Each entry corresponds to one deposit, keyed by the commitment hash
-/// `SHA256(owner || amount || salt)`.
 #[contracttype]
 #[derive(Clone)]
 pub struct EscrowEntry {
     /// Token contract address for the escrowed funds.
     pub token: Address,
-    /// Amount in token base units.
-    pub amount: i128,
+    /// Total amount due in token base units (the target amount to be paid).
+    pub amount_due: i128,
+    /// Amount already paid towards the escrow.
+    pub amount_paid: i128,
     /// Owner who deposited and may refund after expiry.
     pub owner: Address,
-    /// Current status (Pending, Spent, Refunded, Expired).
+    /// Current status (Pending, Spent, Refunded, Expired, Disputed).
     pub status: EscrowStatus,
     /// Ledger timestamp when the escrow was created.
     pub created_at: u64,
     /// Ledger timestamp after which withdrawal is blocked and refund is enabled.
     /// A value of `0` means the escrow never expires (no timeout).
     pub expires_at: u64,
+    /// Optional single arbiter address for dispute resolution (legacy).
+    pub arbiter: Option<Address>,
+    /// Array of arbiter addresses for multi-sig dispute resolution.
+    pub arbiters: Vec<Address>,
+    /// Threshold: number of arbiter votes required to resolve a dispute (M-of-N).
+    /// A value of 0 means single-arbiter mode (uses `arbiter` field).
+    /// A value > 0 means multi-sig mode (uses `arbiters` array).
+    pub arbiter_threshold: u32,
+    /// Optional memo attached to the escrow (max 1024 bytes).
+    pub memo: Option<String>,
+    /// Array of milestones for tracking partial payment progress.
+    pub milestones: Vec<Milestone>,
 }
 
 /// Privacy-aware view of an escrow entry.
 ///
 /// Returned by [`QuickexContract::get_escrow_details`] instead of the raw
-/// [`EscrowEntry`]. Sensitive fields (`amount`, `owner`) are set to `None`
+/// [`EscrowEntry`]. Sensitive fields (`amount_due`, `amount_paid`, `owner`) are set to `None`
 /// when the escrow owner has privacy enabled and the caller is not the owner.
 ///
 /// ## Field visibility
@@ -65,15 +123,19 @@ pub struct EscrowEntry {
 /// | `status`     | ✓           | ✓                            | ✓                               |
 /// | `created_at` | ✓           | ✓                            | ✓                               |
 /// | `expires_at` | ✓           | ✓                            | ✓                               |
-/// | `amount`     | ✓           | ✓                            | `None`                          |
+/// | `amount_due` | ✓           | ✓                            | `None`                          |
+/// | `amount_paid`| ✓           | ✓                            | `None`                          |
 /// | `owner`      | ✓           | ✓                            | `None`                          |
+/// | `memo`       | ✓           | ✓                            | `None`                          |
 #[contracttype]
 #[derive(Clone)]
 pub struct PrivacyAwareEscrowView {
     /// Token contract address (always visible).
     pub token: Address,
-    /// Escrowed amount. `None` when privacy is enabled and caller is not the owner.
-    pub amount: Option<i128>,
+    /// Total amount due. `None` when privacy is enabled and caller is not the owner.
+    pub amount_due: Option<i128>,
+    /// Amount already paid. `None` when privacy is enabled and caller is not the owner.
+    pub amount_paid: Option<i128>,
     /// Owner address. `None` when privacy is enabled and caller is not the owner.
     pub owner: Option<Address>,
     /// Current lifecycle status (always visible).
@@ -82,4 +144,345 @@ pub struct PrivacyAwareEscrowView {
     pub created_at: u64,
     /// Expiry timestamp; `0` means no expiry (always visible).
     pub expires_at: u64,
+    /// Arbiter address for dispute resolution. `None` if not set.
+    pub arbiter: Option<Address>,
+    /// Optional memo. `None` when privacy is enabled and caller is not the owner.
+    pub memo: Option<String>,
+}
+
+/// Arbiter vote on a disputed escrow.
+///
+/// Stored under [`DataKey::DisputeVote`](crate::storage::DataKey::DisputeVote)(commitment, arbiter).
+/// Tracks each arbiter's vote for a specific dispute.
+#[contracttype]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DisputeVote {
+    /// The arbiter who cast this vote.
+    pub arbiter: Address,
+    /// True if voting to refund to owner, false if voting to pay recipient.
+    pub resolve_for_owner: bool,
+    /// Ledger timestamp when the vote was cast.
+    pub voted_at: u64,
+}
+
+/// Parameters for registering an ephemeral key (stealth deposit).
+///
+/// Bundles the 8 arguments of `register_ephemeral_key` into a single struct
+/// to satisfy the `clippy::too_many_arguments` lint (limit: 7).
+#[contracttype]
+#[derive(Clone)]
+pub struct StealthDepositParams {
+    /// Depositor address (must authorize the token transfer).
+    pub sender: Address,
+    /// Token contract address.
+    pub token: Address,
+    /// Total amount due; must be positive.
+    pub amount_due: i128,
+    /// Initial payment amount; must be positive and <= amount_due.
+    pub amount_paid: i128,
+    /// Sender's ephemeral public key (32 bytes).
+    pub eph_pub: BytesN<32>,
+    /// Recipient's spend public key (32 bytes).
+    pub spend_pub: BytesN<32>,
+    /// Pre-computed one-time stealth address (32 bytes).
+    pub stealth_address: BytesN<32>,
+    /// Seconds until expiry; 0 = no expiry.
+    pub timeout_secs: u64,
+}
+
+/// Stealth escrow entry for Privacy v2 (Issue #157).
+///
+/// Locked under a one-time stealth address derived via Diffie-Hellman.
+/// The original recipient's public address is never stored on-chain.
+///
+/// ## Field visibility
+/// - `eph_pub` is public (needed by recipient to scan).
+/// - `token`, `amount_due`, `amount_paid`, `status`, `created_at`, `expires_at` are public.
+/// - The link between `eph_pub` and the recipient's real identity is only
+///   computable by the recipient (who holds the matching private key).
+#[contracttype]
+#[derive(Clone)]
+pub struct StealthEscrowEntry {
+    /// Token contract address for the escrowed funds.
+    pub token: Address,
+    /// Total amount due in token base units (the target amount to be paid).
+    pub amount_due: i128,
+    /// Amount already paid towards the escrow.
+    pub amount_paid: i128,
+    /// Sender's ephemeral public key (32 bytes). Stored so the recipient can
+    /// scan events and re-derive the shared secret off-chain.
+    pub eph_pub: BytesN<32>,
+    /// Current lifecycle status.
+    pub status: EscrowStatus,
+    /// Ledger timestamp when the stealth escrow was created.
+    pub created_at: u64,
+    /// Expiry timestamp; `0` means no expiry.
+    pub expires_at: u64,
+}
+
+/// Fee configuration for the platform.
+///
+/// Stored under [`DataKey::FeeConfig`](crate::storage::DataKey::FeeConfig) in persistent storage.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FeeConfig {
+    /// Fee in basis points (1 = 0.01%, 100 = 1%, 10000 = 100%).
+    pub fee_bps: u32,
+}
+
+/// Snapshot of the global and per-feature pause state.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PauseStatus {
+    pub is_globally_paused: bool,
+    pub global_pause_reason: u32,
+    pub feature_pause_flags: u64,
+}
+
+/// A single fee collector rotation record for audit/history purposes.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeeCollectorRotationEntry {
+    pub rotation_index: u32,
+    pub collector: Address,
+    pub previous_collector: Option<Address>,
+    pub rotated_at: u64,
+}
+
+/// Fee model for escrow TTL extensions.
+///
+/// A single extension is charged proportionally to the duration being added, with
+/// a floor/ceiling guard to keep the model predictable and bounded.
+#[contracttype]
+#[derive(Clone, Copy, Debug)]
+pub struct TtlExtensionFeeConfig {
+    /// Fee charged per second of requested extension duration.
+    pub fee_per_second: i128,
+    /// Minimum total fee for any extension request.
+    pub min_fee: i128,
+    /// Maximum total fee for a single extension request.
+    pub max_fee: i128,
+}
+
+/// Per-asset fee configuration (Fee Router v2 — Issue #305).
+///
+/// Stored under [`DataKey::PerAssetFee`](crate::storage::DataKey::PerAssetFee)`(token)` in
+/// persistent storage. When present for a token, overrides the global [`FeeConfig`] for
+/// that token only. A value of `fee_bps = 0` explicitly disables fees for that token even
+/// if the global config is non-zero.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PerAssetFeeConfig {
+    /// Fee in basis points for this specific token. Overrides the global `FeeConfig`.
+    /// Range: 0 (no fee) to 10000 (100%).
+    pub fee_bps: u32,
+    /// Arbiter's share of the collected fee, expressed in basis points of the fee itself.
+    /// 0 = no arbiter split — entire fee goes to the collector.
+    /// Example: fee_bps=200 (2%), arbiter_bps=2000 (20%) → arbiter gets 0.4%, collector 1.6%.
+    pub arbiter_bps: u32,
+}
+
+/// Oracle fee configuration for dynamic USD-based fee collection.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleFeeConfig {
+    /// External oracle contract address.
+    pub oracle: Address,
+    /// Target fee in microdollars (1 USD = 1_000_000 microdollars).
+    pub usd_fee_micros: i128,
+    /// Maximum age of oracle price data before falling back.
+    pub stale_threshold_secs: u64,
+}
+
+/// A cached oracle price record with its timestamp for staleness checking.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedOraclePrice {
+    /// Price in microdollars per token unit (1_000_000 = 1 USD).
+    pub price_micros: i128,
+    /// Ledger timestamp when this price was recorded.
+    pub recorded_at: u64,
+}
+
+/// Deployment metadata returned by [`crate::QuickexContract::get_deployment_metadata`].
+///
+/// Clients and indexers can call this view to validate compatibility without
+/// any off-chain coordination.
+///
+/// ## Domain separation
+///
+/// `contract_id` is the on-chain address of this contract instance, which
+/// uniquely binds the metadata to a specific deployment and network.  Two
+/// contracts on different networks will always have different `contract_id`
+/// values, so callers can detect cross-network mismatches by comparing
+/// `contract_id` against the address they invoked.
+///
+/// ## Schema stability
+///
+/// The field set of this struct is part of the public API.  Fields must not be
+/// removed or reordered across releases; new optional fields may be appended.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeploymentMetadata {
+    /// Stored contract schema version (see [`crate::storage::CURRENT_CONTRACT_VERSION`]).
+    /// Returns `0` for legacy deployments that pre-date version tracking.
+    pub contract_version: u32,
+    /// Event schema version (see [`crate::events::EVENT_SCHEMA_VERSION`]).
+    /// Indexers must check this before decoding event payloads.
+    pub event_schema_version: u32,
+    /// 32-byte WASM hash recorded at the last `upgrade()` call.
+    /// `None` when the contract has never been upgraded (initial deployment).
+    pub wasm_hash: Option<BytesN<32>>,
+    /// On-chain address of this contract instance.
+    /// Binds the metadata to a specific deployment and network.
+    pub contract_id: Address,
+}
+
+/// Hook event kinds used for external callbacks.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum HookEventKind {
+    Create = 1,
+    Settle = 2,
+    Refund = 3,
+}
+
+/// Privileged roles for contract governance and operations.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum Role {
+    /// Full administrative access, including role management and upgrades.
+    /// Admin also inherits [`Role::Operator`] permissions.
+    Admin = 1,
+    /// Operational access, such as toggling pause flags and fee config.
+    Operator = 2,
+    /// Authorized to resolve disputes across escrows. This is independent of
+    /// the Admin and Operator hierarchy.
+    Arbiter = 3,
+}
+
+/// Configuration for on-chain M-of-N contract governance.
+#[contracttype]
+#[derive(Clone)]
+pub struct GovernanceConfig {
+    pub signers: Vec<Address>,
+    pub threshold: u32,
+    pub timelock_secs: u64,
+}
+
+/// Actions that can be authorized by a governance proposal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GovernanceAction {
+    SetAdmin(Address),
+    GrantRole(Address, Role),
+    RevokeRole(Address, Role),
+    SetPaused(bool, u32),
+    SetPauseFlags(u64, u64, u32, u32),
+    SetFeeConfig(FeeConfig),
+    SetPerAssetFee(Address, PerAssetFeeConfig),
+    SetOracleFeeConfig(OracleFeeConfig),
+    RecordOraclePrice(i128),
+    SetPlatformWallet(Address),
+    RotateFeeCollector(Address),
+    SetHookAllowed(Address, bool),
+    RegisterHook(Address),
+    UnregisterHook(Address),
+    SetUpgradeWindow(u64, u64),
+    RotateSigners(Vec<Address>, u32),
+    SetTimelock(u64),
+    Upgrade(BytesN<32>, u32),
+}
+
+/// Durable proposal state; approvals and cancellation votes are unique signer lists.
+#[contracttype]
+#[derive(Clone)]
+pub struct GovernanceProposal {
+    pub action: GovernanceAction,
+    pub proposer: Address,
+    pub approvals: Vec<Address>,
+    pub cancellation_votes: Vec<Address>,
+    pub execute_after: u64,
+    pub executed: bool,
+    pub canceled: bool,
+}
+
+/// Canonical pause reason codes.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum PauseReason {
+    Unknown = 0,
+    SystemMaintenance = 1,
+    SecurityEmergency = 2,
+    FeatureUpgrade = 3,
+    RegulatoryCompliance = 4,
+    OperatorIntervention = 5,
+}
+
+/// Escrow extension record for TTL renewal (Issue #113).
+#[contracttype]
+#[derive(Clone)]
+pub struct EscrowExtension {
+    /// Commitment hash of the escrow being extended.
+    pub commitment: BytesN<32>,
+    /// Number of times this escrow has been extended.
+    pub extension_count: u32,
+    /// Timestamp of the last extension.
+    pub last_extended_at: u64,
+    /// New expires_at value after this extension.
+    pub new_expires_at: u64,
+}
+
+/// Dispute evidence record (Issue #115).
+#[contracttype]
+#[derive(Clone)]
+pub struct DisputeEvidence {
+    /// Commitment hash of the disputed escrow.
+    pub commitment: BytesN<32>,
+    /// Hash of the evidence data (typically SHA256).
+    pub evidence_hash: BytesN<32>,
+    /// Address of the party submitting evidence.
+    pub submitted_by: Address,
+    /// Timestamp when evidence was submitted.
+    pub submitted_at: u64,
+}
+
+/// Lifecycle status of a privacy key rotation.
+///
+/// Tracks the state of a key rotation request from initiation through
+/// completion or cancellation.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyRotationStatus {
+    /// Rotation has been requested but not yet finalized.
+    Pending,
+    /// Rotation completed and the new key is active.
+    Completed,
+    /// Rotation was canceled before completion.
+    Canceled,
+}
+
+/// Persisted record of a privacy key rotation.
+///
+/// Stored by the privacy module so rotation state can be queried and audited
+/// on-chain. The record binds the owner, the previous and new key material,
+/// and the timestamps at which the rotation was requested and finalized.
+#[contracttype]
+#[derive(Clone)]
+pub struct KeyRotationRecord {
+    /// Owner whose privacy key is being rotated.
+    pub owner: Address,
+    /// Previous public key (32 bytes) being replaced.
+    pub old_key: BytesN<32>,
+    /// New public key (32 bytes) that becomes active on completion.
+    pub new_key: BytesN<32>,
+    /// Current status of the rotation.
+    pub status: KeyRotationStatus,
+    /// Ledger timestamp when the rotation was requested.
+    pub requested_at: u64,
+    /// Ledger timestamp when the rotation was completed; `0` while pending.
+    pub completed_at: u64,
 }

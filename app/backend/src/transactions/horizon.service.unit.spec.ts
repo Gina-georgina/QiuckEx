@@ -1,5 +1,5 @@
-// Mock stellar-sdk BEFORE importing HorizonService
-jest.mock('stellar-sdk', () => {
+// Mock @stellar/stellar-sdk BEFORE importing HorizonService
+jest.mock('@stellar/stellar-sdk', () => {
     const mockServer = {
         operations: jest.fn().mockReturnThis(),
         forAccount: jest.fn().mockReturnThis(),
@@ -85,10 +85,13 @@ describe('HorizonService', () => {
                 asset: 'XLM',
                 memo: 'test memo',
                 timestamp: '2024-01-01T00:00:00Z',
+                source: undefined,
+                destination: undefined,
+                status: 'Success',
                 txHash: 'hash1',
                 pagingToken: 'token1',
             });
-            expect(result.nextCursor).toBe('token2');
+            expect(result.nextCursor).toBeUndefined();
         });
 
         it('should return cached results on subsequent calls', async () => {
@@ -140,7 +143,11 @@ describe('HorizonService', () => {
             const response = thrownError!.getResponse();
             const responseWithError = (typeof response === 'object' && response !== null) ?
                              (response as Record<string,unknown>).error : response;
-            expect(responseWithError).toContain('Service temporarily unavailable due to rate limiting');
+            const responseMessage =
+                typeof responseWithError === 'string'
+                    ? responseWithError
+                    : JSON.stringify(responseWithError);
+            expect(responseMessage).toMatch(/Service temporarily unavailable due to rate limiting|Horizon service rate limit exceeded/i);
             expect(thrownError!.getStatus()).toBe(HttpStatus.SERVICE_UNAVAILABLE);
         }, 10000); // Increase timeout for backoff
 

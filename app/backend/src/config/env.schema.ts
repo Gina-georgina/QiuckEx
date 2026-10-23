@@ -12,11 +12,67 @@ export const envSchema = Joi.object({
     .default(4000)
     .description("Port number for the server"),
 
+  API_BASE_URL: Joi.string()
+    .uri({ scheme: ["http", "https"] })
+    .empty("")
+    .optional()
+    .description("Base API URL exposed to frontend via bootstrap endpoint"),
+
+  APP_VERSION: Joi.string()
+    .empty("")
+    .optional()
+    .description("Application release version string"),
+
+  ROUTER_CONTRACT_ID: Joi.string()
+    .empty("")
+    .optional()
+    .description("Router Soroban contract address"),
+
+  ALLOWED_TOKENS: Joi.string()
+    .empty("")
+    .optional()
+    .description("Comma-separated list of pre-allowed token addresses"),
+
+  STELLAR_NETWORK_PASSPHRASE: Joi.string()
+    .empty("")
+    .optional()
+    .description("Explicit Stellar network passphrase override"),
+
   // Network configuration (required)
   NETWORK: Joi.string()
     .valid("testnet", "mainnet")
     .required()
     .description("Stellar network to connect to (testnet or mainnet)"),
+
+  CONTRACT_REGISTRY_MANIFEST_PUBLIC_KEYS: Joi.string()
+    .empty("")
+    .optional()
+    .custom((value, helpers) => {
+      let keys: unknown;
+      try {
+        keys = JSON.parse(value);
+      } catch {
+        return helpers.error('any.invalid');
+      }
+      if (!keys || typeof keys !== 'object' || Array.isArray(keys) || Object.keys(keys).length === 0) {
+        return helpers.error('any.invalid');
+      }
+      const validEntries = Object.entries(keys).every(([keyId, publicKey]) =>
+        /^[a-zA-Z0-9._-]{1,64}$/.test(keyId) &&
+        typeof publicKey === 'string' &&
+        publicKey.includes('-----BEGIN PUBLIC KEY-----') &&
+        publicKey.includes('-----END PUBLIC KEY-----'));
+      if (!validEntries) return helpers.error('any.invalid');
+      return value;
+    })
+    .description("JSON object mapping trusted deployment manifest key IDs to Ed25519 public-key PEMs"),
+
+  STELLAR_NETWORK: Joi.string()
+    .valid("testnet", "mainnet")
+    .optional()
+    .description(
+      "Optional alias for NETWORK; must match NETWORK when both are set",
+    ),
 
   // Supabase configuration (required for database operations)
   SUPABASE_URL: Joi.string()
@@ -29,11 +85,87 @@ export const envSchema = Joi.object({
     .required()
     .description("Supabase anonymous key"),
 
+  SUPABASE_SERVICE_ROLE_KEY: Joi.string()
+    .optional()
+    .description("Supabase service role key for admin operations"),
+
+  // Stellar Horizon configuration (required for blockchain operations)
+  HORIZON_URL: Joi.string()
+    .uri({ scheme: ["http", "https"] })
+    .optional()
+    .description("Custom Horizon URL (overrides network default)"),
+
+  SOROBAN_RPC_URL: Joi.string()
+    .uri({ scheme: ["http", "https"] })
+    .optional()
+    .description("Custom Soroban RPC URL (overrides network default)"),
+
+  SOROBAN_RPC_URLS: Joi.string()
+    .optional()
+    .description("Comma-separated fallback Soroban RPC URLs for failover"),
+
+  SOROBAN_RPC_TIMEOUT_MS: Joi.number()
+    .integer()
+    .min(1000)
+    .default(10000)
+    .description("Timeout in milliseconds for Soroban RPC requests"),
+
+  SOROBAN_RPC_MAX_RETRIES: Joi.number()
+    .integer()
+    .min(1)
+    .max(10)
+    .default(3)
+    .description("Max retry attempts for transient Soroban RPC failures"),
+
+  STELLAR_EXPLORER_URL: Joi.string()
+    .uri({ scheme: ["http", "https"] })
+    .optional()
+    .description("Custom Stellar explorer URL (overrides network default)"),
+
+  // Stellar signing keys (required for payment operations)
+  STELLAR_SECRET_KEY: Joi.string()
+    .optional()
+    .description(
+      "Stellar account secret key for signing transactions (starts with S)",
+    ),
+
+  STELLAR_PUBLIC_KEY: Joi.string()
+    .optional()
+    .description("Stellar account public key (starts with G)"),
+
   // Node environment
   NODE_ENV: Joi.string()
     .valid("development", "production", "test")
     .default("development")
     .description("Node environment"),
+
+  // CORS configuration
+  PUBLIC_API_URL: Joi.string()
+    .uri({ scheme: ["http", "https"] })
+    .empty("")
+    .optional()
+    .description("Public API base URL exposed by the runtime config endpoint for client bootstrapping"),
+
+  CORS_ALLOWED_ORIGINS: Joi.string()
+    .empty("")
+    .optional()
+    .description(
+      "Comma-separated list of allowed CORS origins (e.g. https://quickex.to,https://app.quickex.to). " +
+        "Required in production when no wildcard is desired.",
+    ),
+
+  // New rate limit allowlist configuration
+  RATE_LIMIT_ALLOWLIST_CIDRS: Joi.string().optional().description("Comma-separated CIDRs to whitelist from rate limits (CI, trusted contributors)"),
+  RATE_LIMIT_ALLOWLIST_API_KEYS: Joi.string().optional().description("Comma-separated API keys to whitelist from rate limits"),
+  RATE_LIMIT_ALLOWLIST_USER_IDS: Joi.string().optional().description("Comma-separated user IDs to whitelist from rate limits"),
+
+  CORS_VERCEL_PROJECT: Joi.string()
+    .empty("")
+    .optional()
+    .description(
+      "Vercel project slug (e.g. quickex-frontend). " +
+        "When set, all preview URLs matching https://<slug>-*.vercel.app are allowed.",
+    ),
 
   // Username reservation limit (optional). Max usernames per wallet; omit for no limit.
   MAX_USERNAMES_PER_WALLET: Joi.number()
@@ -55,8 +187,47 @@ export const envSchema = Joi.object({
     .default(60000)
     .description("Cache TTL in milliseconds for transaction responses"),
 
+  FEATURE_FLAGS_CACHE_TTL_MS: Joi.number()
+    .integer()
+    .min(1000)
+    .default(15000)
+    .description("Cache TTL in milliseconds for feature flag snapshots"),
+
+  // Branch preview fallback configuration
+  FALLBACK_API_URL: Joi.string()
+    .uri({ scheme: ["http", "https"] })
+    .default("https://api.quickex.io")
+    .description("Fallback API URL for unknown branches"),
+  FALLBACK_FRONTEND_URL: Joi.string()
+    .uri({ scheme: ["http", "https"] })
+    .default("https://app.quickex.io")
+    .description("Fallback frontend URL for unknown branches"),
+
+  FEATURE_FLAGS_BOOTSTRAP_JSON: Joi.string()
+    .empty("")
+    .optional()
+    .description(
+      "Optional JSON array of bootstrap feature flags used when the store is unavailable",
+    ),
+
+  // Contract method allowlist (BE-67)
+  CONTRACT_METHOD_ALLOWLIST_MODE: Joi.string()
+    .valid("enforce", "off")
+    .default("enforce")
+    .description(
+      "When 'enforce', unlisted contract/method pairs are rejected on transaction build/submit endpoints",
+    ),
+
+  CONTRACT_METHOD_ALLOWLIST_JSON: Joi.string()
+    .empty("")
+    .optional()
+    .description(
+      'Optional JSON object mapping contractId -> allowed method names, or "*" to allow all methods for that contract. Example: {"CABC...":["swap","deposit"],"CDEF...":"*"}',
+    ),
+
   // Stellar ingestion (optional; omit to disable)
   QUICKEX_CONTRACT_ID: Joi.string()
+    .empty("")
     .optional()
     .description(
       "Soroban contract ID to stream events from (enables Stellar ingestion service)",
@@ -68,15 +239,18 @@ export const envSchema = Joi.object({
 
   // SendGrid email channel
   SENDGRID_API_KEY: Joi.string()
+    .empty("")
     .optional()
     .description("SendGrid API key — enables email notification channel"),
 
   SENDGRID_FROM_EMAIL: Joi.string()
+    .empty("")
     .optional()
     .description("From address for SendGrid emails (e.g. noreply@quickex.to)"),
 
   // Expo push channel
   EXPO_ACCESS_TOKEN: Joi.string()
+    .empty("")
     .optional()
     .description(
       "Expo server access token — enhances push notification delivery priority",
@@ -91,6 +265,262 @@ export const envSchema = Joi.object({
     .description(
       "Max records per entity type processed per reconciliation run",
     ),
+
+  // Rate limiting — optional bcrypt-hashed API keys (comma-separated)
+  // Generate a hash: node -e "require('bcrypt').hash('MY_KEY', 10).then(console.log)"
+  API_KEYS: Joi.string()
+    .empty("")
+    .optional()
+    .description(
+      "Comma-separated list of bcrypt-hashed API keys for trusted clients. " +
+        "Valid keys receive higher rate limits (120 req/min vs 20 req/min).",
+    ),
+
+  // Global HTTP rate-limiting profiles (all optional; defaults applied)
+  RATE_LIMIT_PUBLIC_BURST_LIMIT: Joi.number()
+    .integer()
+    .min(1)
+    .default(10)
+    .description("Public traffic burst request limit"),
+  RATE_LIMIT_PUBLIC_BURST_TTL_MS: Joi.number()
+    .integer()
+    .min(1000)
+    .default(10000)
+    .description("Public traffic burst window in milliseconds"),
+  RATE_LIMIT_PUBLIC_SUSTAINED_LIMIT: Joi.number()
+    .integer()
+    .min(1)
+    .default(20)
+    .description("Public traffic sustained request limit"),
+  RATE_LIMIT_PUBLIC_SUSTAINED_TTL_MS: Joi.number()
+    .integer()
+    .min(1000)
+    .default(60000)
+    .description("Public traffic sustained window in milliseconds"),
+
+  RATE_LIMIT_AUTHENTICATED_BURST_LIMIT: Joi.number()
+    .integer()
+    .min(1)
+    .default(40)
+    .description("Authenticated traffic burst request limit"),
+  RATE_LIMIT_AUTHENTICATED_BURST_TTL_MS: Joi.number()
+    .integer()
+    .min(1000)
+    .default(10000)
+    .description("Authenticated traffic burst window in milliseconds"),
+  RATE_LIMIT_AUTHENTICATED_SUSTAINED_LIMIT: Joi.number()
+    .integer()
+    .min(1)
+    .default(120)
+    .description("Authenticated traffic sustained request limit"),
+  RATE_LIMIT_AUTHENTICATED_SUSTAINED_TTL_MS: Joi.number()
+    .integer()
+    .min(1000)
+    .default(60000)
+    .description("Authenticated traffic sustained window in milliseconds"),
+
+  RATE_LIMIT_WEBHOOKS_BURST_LIMIT: Joi.number()
+    .integer()
+    .min(1)
+    .default(20)
+    .description("Webhook traffic burst request limit"),
+  RATE_LIMIT_WEBHOOKS_BURST_TTL_MS: Joi.number()
+    .integer()
+    .min(1000)
+    .default(10000)
+    .description("Webhook traffic burst window in milliseconds"),
+  RATE_LIMIT_WEBHOOKS_SUSTAINED_LIMIT: Joi.number()
+    .integer()
+    .min(1)
+    .default(60)
+    .description("Webhook traffic sustained request limit"),
+  RATE_LIMIT_WEBHOOKS_SUSTAINED_TTL_MS: Joi.number()
+    .integer()
+    .min(1000)
+    .default(60000)
+    .description("Webhook traffic sustained window in milliseconds"),
+
+  RATE_LIMIT_KEY_ORDER: Joi.string()
+    .default("user_id,api_key,ip")
+    .description(
+      "Preferred key order for rate-limit identity. Allowed values: user_id,api_key,ip",
+    ),
+
+  RATE_LIMIT_PROFILE: Joi.string()
+    .valid("local", "preview", "staging", "production", "testnet")
+    .optional()
+    .description(
+      "Optional explicit rate-limit profile. When omitted it is derived from ENVIRONMENT_NAME / NODE_ENV / NETWORK.",
+    ),
+
+  // ---------------------------------------------------------------------------
+  // Sentry Error Monitoring (optional; omit to disable)
+  // ---------------------------------------------------------------------------
+
+  // Analytics stale-data fallback (graceful degradation when data source fails)
+  ANALYTICS_STALE_CACHE_TTL_MS: Joi.number()
+    .integer()
+    .min(1)
+    .default(5 * 60 * 1000)
+    .description(
+      "Retention TTL (ms) for the last successful analytics report served when the data source is unavailable.",
+    ),
+
+  // Redis (optional; Redi-backed health/caching features degrade gracefully)
+  REDIS_URL: Joi.string()
+    .empty("")
+    .optional()
+    .description(
+      "Redis connection URL (redis://...). When omitted, Redis-backed features use in-memory fallbacks.",
+    ),
+
+  SENTRY_DSN: Joi.string()
+    .uri({ scheme: ["http", "https"] })
+    .empty("")
+    .optional()
+    .description("Sentry DSN for error reporting — omit to disable Sentry"),
+
+  SENTRY_ENVIRONMENT: Joi.string()
+    .empty("")
+    .optional()
+    .description(
+      "Sentry environment tag (e.g. production, staging). Falls back to NODE_ENV.",
+    ),
+
+  SENTRY_RELEASE: Joi.string()
+    .empty("")
+    .optional()
+    .description("Sentry release identifier (e.g. quickex-backend@1.2.3)"),
+
+  SENTRY_TRACES_SAMPLE_RATE: Joi.number()
+    .min(0)
+    .max(1)
+    .optional()
+    .default(0.1)
+    .description(
+      "Sentry performance traces sample rate (0.0 to 1.0). Default: 0.1",
+    ),
+
+  SENTRY_PROFILES_SAMPLE_RATE: Joi.number()
+    .min(0)
+    .max(1)
+    .optional()
+    .default(1.0)
+    .description("Sentry profiling sample rate (0.0 to 1.0). Default: 1.0"),
+
+  // ---------------------------------------------------------------------------
+  // Staging Environment Parity Configuration (optional)
+  // ---------------------------------------------------------------------------
+
+  // Enable environment parity checks at startup
+  ENV_PARITY_CHECK_ENABLED: Joi.boolean()
+    .default(false)
+    .description("Enable environment parity validation checks at startup"),
+
+  // Production base URL for parity comparison
+  PRODUCTION_BASE_URL: Joi.string()
+    .uri({ scheme: ["http", "https"] })
+    .empty("")
+    .optional()
+    .description("Production API base URL for environment parity checks"),
+
+  // Enable shadow traffic mode (read-only endpoint mirroring)
+  SHADOW_TRAFFIC_ENABLED: Joi.boolean()
+    .default(false)
+    .description("Enable shadow traffic mode for selected read endpoints"),
+
+  // Shadow traffic sample rate (0.0 to 1.0)
+  SHADOW_TRAFFIC_SAMPLE_RATE: Joi.number()
+    .min(0)
+    .max(1)
+    .default(0.1)
+    .description("Sample rate for shadow traffic (0.0 to 1.0). Default: 0.1"),
+
+  // Comma-separated list of endpoints to shadow (e.g., /api/links,/api/transactions)
+  SHADOW_TRAFFIC_ENDPOINTS: Joi.string()
+    .empty("")
+    .default("/api/links,/api/transactions,/api/usernames")
+    .description("Comma-separated list of read endpoints to shadow"),
+
+  // Enable safe test data seeding for staging
+  STAGING_SEED_DATA_ENABLED: Joi.boolean()
+    .default(false)
+    .description("Enable automatic test data seeding in staging environment"),
+
+  // Staging environment identifier
+  ENVIRONMENT_NAME: Joi.string()
+    .valid("development", "staging", "production", "test")
+    .optional()
+    .description("Explicit environment name for parity tracking"),
+
+  // ── Indexer Lag Guard ─────────────────────────────────────────────────────
+  INDEXER_LAG_THRESHOLD_LEDGERS: Joi.number()
+    .integer()
+    .min(1)
+    .default(100)
+    .description("Maximum allowed lag in ledgers before blocking risky operations"),
+  INDEXER_LAG_GUARD_ENABLED: Joi.boolean()
+    .default(true)
+    .description("Whether the indexer lag guard is enabled"),
+  INDEXER_LAG_GUARD_OVERRIDE: Joi.boolean()
+    .default(false)
+    .description("Admin override to disable lag guard temporarily (for emergencies)"),
+
+  // ── Abuse Signal Configuration ──────────────────────────────────────────
+  ABUSE_SIGNAL_RETENTION_DAYS: Joi.number()
+    .integer()
+    .min(1)
+    .max(365)
+    .default(90)
+    .description("Days to retain abuse signals before auto-pruning"),
+  ABUSE_SIGNAL_SCORE_THRESHOLD: Joi.number()
+    .integer()
+    .min(0)
+    .max(100)
+    .default(30)
+    .description("Abuse score threshold for flagging as suspicious"),
+  ABUSE_SIGNAL_GEO_ENABLED: Joi.boolean()
+    .default(false)
+    .description("Enable geo-lite lookups for abuse signals"),
+  ABUSE_SIGNAL_HASH_SALT: Joi.string()
+    .empty("")
+    .default("default-abuse-salt")
+    .description("Salt for IP/UA hashing in abuse signals"),
+  MARKETPLACE_RESTRICTED_USERNAMES: Joi.string()
+    .allow("")
+    .default("")
+    .description("Comma-separated usernames blocked from marketplace listings"),
+
+  PREVIEW_INACTIVITY_THRESHOLD_MS: Joi.number()
+    .integer()
+    .min(0)
+    .default(3 * 24 * 60 * 60 * 1000)
+    .description("Inactivity window before branch preview auto-expiry"),
+  PREVIEW_MAX_AGE_MS: Joi.number()
+    .integer()
+    .min(0)
+    .default(14 * 24 * 60 * 60 * 1000)
+    .description("Maximum age before branch preview auto-expiry"),
+
+  // ── Compatibility Gate ──────────────────────────────────────────────────
+  COMPATIBILITY_BASELINE_PATH: Joi.string()
+    .empty("")
+    .optional()
+    .description(
+      "Filesystem path to the compatibility baseline artifact used by the compatibility gate",
+    ),
+  COMPATIBILITY_OVERRIDE_ALLOWLIST: Joi.string()
+    .empty("")
+    .optional()
+    .description(
+      "Comma-separated list of identities permitted to override compatibility gate failures",
+    ),
+  COMPATIBILITY_GATE_MODE: Joi.string()
+    .valid("enforce", "warn", "off")
+    .default("enforce")
+    .description(
+      "Compatibility gate enforcement mode: 'enforce' blocks incompatible changes, 'warn' logs only, 'off' disables the gate",
+    ),
 });
 
 /**
@@ -98,16 +528,83 @@ export const envSchema = Joi.object({
  */
 export interface EnvConfig {
   PORT: number;
+  API_BASE_URL?: string;
+  APP_VERSION?: string;
+  ROUTER_CONTRACT_ID?: string;
+  ALLOWED_TOKENS?: string;
+  STELLAR_NETWORK_PASSPHRASE?: string;
   NETWORK: "testnet" | "mainnet";
+  STELLAR_NETWORK?: "testnet" | "mainnet";
   SUPABASE_URL: string;
   SUPABASE_ANON_KEY: string;
+  SUPABASE_SERVICE_ROLE_KEY?: string;
+  HORIZON_URL?: string;
+  SOROBAN_RPC_URL?: string;
+  SOROBAN_RPC_URLS?: string;
+  SOROBAN_RPC_TIMEOUT_MS: number;
+  SOROBAN_RPC_MAX_RETRIES: number;
+  STELLAR_EXPLORER_URL?: string;
+  STELLAR_SECRET_KEY?: string;
+  STELLAR_PUBLIC_KEY?: string;
   NODE_ENV: "development" | "production" | "test";
+  PUBLIC_API_URL?: string;
+
+  CORS_ALLOWED_ORIGINS?: string;
+  CORS_VERCEL_PROJECT?: string;
   MAX_USERNAMES_PER_WALLET?: number;
   CACHE_MAX_ITEMS: number;
   CACHE_TTL_MS: number;
+  FEATURE_FLAGS_CACHE_TTL_MS: number;
+  FEATURE_FLAGS_BOOTSTRAP_JSON?: string;
+  CONTRACT_METHOD_ALLOWLIST_MODE: "enforce" | "off";
+  CONTRACT_METHOD_ALLOWLIST_JSON?: string;
   QUICKEX_CONTRACT_ID?: string;
   SENDGRID_API_KEY?: string;
   SENDGRID_FROM_EMAIL?: string;
   EXPO_ACCESS_TOKEN?: string;
   RECONCILIATION_BATCH_SIZE: number;
+  API_KEYS?: string;
+  RATE_LIMIT_PUBLIC_BURST_LIMIT: number;
+  RATE_LIMIT_PUBLIC_BURST_TTL_MS: number;
+  RATE_LIMIT_PUBLIC_SUSTAINED_LIMIT: number;
+  RATE_LIMIT_PUBLIC_SUSTAINED_TTL_MS: number;
+  RATE_LIMIT_AUTHENTICATED_BURST_LIMIT: number;
+  RATE_LIMIT_AUTHENTICATED_BURST_TTL_MS: number;
+  RATE_LIMIT_AUTHENTICATED_SUSTAINED_LIMIT: number;
+  RATE_LIMIT_AUTHENTICATED_SUSTAINED_TTL_MS: number;
+  RATE_LIMIT_WEBHOOKS_BURST_LIMIT: number;
+  RATE_LIMIT_WEBHOOKS_BURST_TTL_MS: number;
+  RATE_LIMIT_WEBHOOKS_SUSTAINED_LIMIT: number;
+  RATE_LIMIT_WEBHOOKS_SUSTAINED_TTL_MS: number;
+  RATE_LIMIT_KEY_ORDER: string;
+  RATE_LIMIT_PROFILE?: "local" | "preview" | "staging" | "production" | "testnet";
+  RATE_LIMIT_ALLOWLIST_CIDRS?: string;
+  RATE_LIMIT_ALLOWLIST_API_KEYS?: string;
+  RATE_LIMIT_ALLOWLIST_USER_IDS?: string;
+  ANALYTICS_STALE_CACHE_TTL_MS: number;
+  REDIS_URL?: string;
+  SENTRY_DSN?: string;
+  SENTRY_ENVIRONMENT?: string;
+  SENTRY_RELEASE?: string;
+  SENTRY_TRACES_SAMPLE_RATE: number;
+  SENTRY_PROFILES_SAMPLE_RATE: number;
+  ENV_PARITY_CHECK_ENABLED: boolean;
+  PRODUCTION_BASE_URL?: string;
+  SHADOW_TRAFFIC_ENABLED: boolean;
+  SHADOW_TRAFFIC_SAMPLE_RATE: number;
+  SHADOW_TRAFFIC_ENDPOINTS: string;
+  STAGING_SEED_DATA_ENABLED: boolean;
+  ENVIRONMENT_NAME?: "development" | "staging" | "production" | "test";
+  INDEXER_LAG_THRESHOLD_LEDGERS: number;
+  INDEXER_LAG_GUARD_ENABLED: boolean;
+  INDEXER_LAG_GUARD_OVERRIDE: boolean;
+  ABUSE_SIGNAL_RETENTION_DAYS: number;
+  ABUSE_SIGNAL_SCORE_THRESHOLD: number;
+  ABUSE_SIGNAL_GEO_ENABLED: boolean;
+  ABUSE_SIGNAL_HASH_SALT: string;
+  PREVIEW_INACTIVITY_THRESHOLD_MS: number;
+  PREVIEW_MAX_AGE_MS: number;
+  COMPATIBILITY_BASELINE_PATH?: string;
+  COMPATIBILITY_OVERRIDE_ALLOWLIST?: string;
+  COMPATIBILITY_GATE_MODE: "enforce" | "warn" | "off";
 }

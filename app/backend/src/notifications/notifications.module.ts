@@ -1,6 +1,10 @@
-import { Module } from "@nestjs/common";
+import { Module, forwardRef } from "@nestjs/common";
 
 import { SupabaseModule } from "../supabase/supabase.module";
+import { MetricsModule } from "../metrics/metrics.module";
+import { AuditModule } from "../audit/audit.module";
+import { ApiKeysModule } from "../api-keys/api-keys.module";
+import { MetricsService } from "../metrics/metrics.service";
 import { NotificationService } from "./notification.service";
 import { NotificationPreferencesRepository } from "./notification-preferences.repository";
 import { NotificationLogRepository } from "./notification-log.repository";
@@ -10,7 +14,25 @@ import {
   SendGridEmailProvider,
   ExpoPushProvider,
   WebhookProvider,
+  NoopNotificationProvider,
 } from "./providers/notification-provider.interface";
+import { TelegramRepository } from "./telegram/telegram.repository";
+import { TelegramBotService } from "./telegram/telegram-bot.service";
+import { TelegramNotificationProvider } from "./telegram/telegram.provider";
+import { TelegramController } from "./telegram/telegram.controller";
+import { WebhookService } from "./webhook.service";
+import { WebhooksController } from "./webhooks.controller";
+import { WebhookRetryScheduler } from "./webhook-retry.scheduler";
+import { WebhookReplayService } from "./webhook-replay.service";
+import { WebhookReplayRepository } from "./webhook-replay.repository";
+import { JobQueueModule } from "../job-queue/job-queue.module";
+import { InAppNotificationRepository } from "./in-app-notification.repository";
+import { TemplateService } from "./template.service";
+import { NotificationsController } from "./notifications.controller";
+// Template versioning system
+import { TemplatesController } from "./template-versioning/templates.controller";
+import { TemplateVersionRepository } from "./template-versioning/template-version.repository";
+import { TemplateVersionService } from "./template-versioning/template-version.service";
 
 /**
  * Notification engine module.
@@ -18,35 +40,95 @@ import {
  * Provider configuration is driven by environment variables:
  *  - SENDGRID_API_KEY + SENDGRID_FROM_EMAIL  → enables email channel
  *  - EXPO_ACCESS_TOKEN (optional)            → enables push channel
+ *  - TELEGRAM_BOT_TOKEN (optional)           → enables Telegram channel
  *  - Webhook channel is always registered (no credentials needed)
  *
  * ScheduleModule is registered once at AppModule level.
  */
 @Module({
-  imports: [SupabaseModule],
-  controllers: [NotificationPreferencesController],
+  imports: [SupabaseModule, MetricsModule, AuditModule, ApiKeysModule, forwardRef(() => JobQueueModule)],
+  controllers: [
+    NotificationPreferencesController,
+    TelegramController,
+    WebhooksController,
+    NotificationsController,
+    TemplatesController, // New template versioning controller
+  ],
   providers: [
     NotificationPreferencesRepository,
     NotificationLogRepository,
+    InAppNotificationRepository,
+    TemplateService,
+    // Template versioning system
+    TemplateVersionRepository,
+    TemplateVersionService,
+    TelegramRepository,
+    TelegramBotService,
+    TelegramNotificationProvider,
+    WebhookRetryScheduler,
+    WebhookReplayRepository,
+    WebhookReplayService,
+    WebhookService,
     {
       provide: NOTIFICATION_PROVIDERS,
-      useFactory: () => {
+      useFactory: (
+        telegramBot: TelegramBotService,
+        telegramRepo: TelegramRepository,
+        metrics: MetricsService,
+      ) => {
         const providers = [];
 
         const sendgridKey = process.env["SENDGRID_API_KEY"];
         const fromEmail = process.env["SENDGRID_FROM_EMAIL"];
         if (sendgridKey && fromEmail) {
           providers.push(new SendGridEmailProvider(sendgridKey, fromEmail));
+        } else {
+          providers.push(new NoopNotificationProvider("email"));
         }
 
-        providers.push(new ExpoPushProvider(process.env["EXPO_ACCESS_TOKEN"]));
-        providers.push(new WebhookProvider());
+        const expoToken = process.env["EXPO_ACCESS_TOKEN"];
+        if (expoToken) {
+          providers.push(new ExpoPushProvider(expoToken));
+        } else {
+          providers.push(new NoopNotificationProvider("push"));
+        }
+
+        providers.push(new WebhookProvider(metrics));
+
+        // Add Telegram provider if bot is initialized
+        const telegramToken = process.env["TELEGRAM_BOT_TOKEN"];
+        if (telegramToken) {
+          providers.push(
+            new TelegramNotificationProvider(telegramBot, telegramRepo),
+          );
+        } else {
+          providers.push(new NoopNotificationProvider("telegram"));
+        }
 
         return providers;
       },
+      inject: [TelegramBotService, TelegramRepository, MetricsService],
     },
     NotificationService,
   ],
-  exports: [NotificationService, NotificationPreferencesRepository],
+  exports: [
+    NotificationService,
+    NotificationPreferencesRepository,
+    NotificationLogRepository,
+    TelegramRepository,
+    TelegramBotService,
+    TelegramNotificationProvider,
+    WebhookService,
+  ],
 })
 export class NotificationsModule {}
+
+/**
+ * Factory function to create Telegram provider with dependencies
+ */
+export function createTelegramProvider(
+  telegramBot: TelegramBotService,
+  telegramRepo: TelegramRepository,
+): TelegramNotificationProvider {
+  return new TelegramNotificationProvider(telegramBot, telegramRepo);
+}

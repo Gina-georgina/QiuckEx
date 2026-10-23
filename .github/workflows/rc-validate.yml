@@ -1,0 +1,134 @@
+name: Release Candidate Validation
+
+# One command, one definition of the gate. This workflow calls
+# scripts/rc-validate.sh — the same script a contributor runs locally — so
+# "green locally" and "green in CI" cannot mean different things.
+#
+# This is the standalone, manual/nightly entry point to the gate. The CD
+# pipeline also runs an `rc-validate` job that invokes the exact same
+# `pnpm rc:validate` command and honours the same exit-code contract; the two
+# are kept in sync deliberately. To avoid duplicate or conflicting runs, this
+# workflow does NOT trigger on pull_request — per-PR early warning is owned by
+# the CD pipeline's `rc-validate` job.
+#
+# Triggers:
+#   workflow_dispatch — the manual release-candidate gate, including the slow
+#                      stages that per-PR CI does not run.
+#   schedule          — nightly regression run against main, so a candidate is
+#                      never validated only at the moment someone remembers to.
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Stages to run (comma-separated, blank = all)"
+        type: string
+        default: ""
+      allow_skip:
+        description: "Accept the run when an optional stage is skipped"
+        type: boolean
+        default: false
+      ref:
+        description: "Ref to validate"
+        type: string
+        default: "main"
+  schedule:
+    # 04:23 UTC daily.
+    - cron: "23 4 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  # Shared with the CD pipeline's `rc-validate` job so the two entry points
+  # cannot run the gate against the same ref at the same time.
+  group: rc-validate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # The capability-map stage diffs against the base ref.
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/contract
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install detect-secrets
+        run: pip install detect-secrets
+
+      # Placeholder credentials for the OpenAPI export. The export boots the
+      # Nest app, which validates its environment with Joi, but never reaches
+      # Supabase. These are not secrets and must never be replaced with real
+      # credentials in this workflow file.
+      - name: Run release candidate gate
+        env:
+          # A candidate is validated against testnet only. The script refuses
+          # mainnet outright — see docs/adr/0002.
+          STELLAR_NETWORK: testnet
+          RC_BASE_REF: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [ -n "${{ inputs.stage }}" ]; then
+            ARGS+=(--stage "${{ inputs.stage }}")
+          fi
+          if [ "${{ inputs.allow_skip }}" = "true" ]; then
+            ARGS+=(--allow-skip)
+          fi
+          # Same command and exit-code contract as the CD pipeline's
+          # `rc-validate` job: non-zero exit fails the gate.
+          pnpm rc:validate "${ARGS[@]}"
+
+      # The compatibility gate is a hard promotion blocker: a candidate with
+      # breaking API changes must never be promoted. It runs after the main
+      # gate so a failing compatibility check is reported separately from the
+      # rest of the validation, and it is never skipped — not on pull_request
+      # (where the main gate runs --quick) and not via allow_skip.
+      - name: Check API compatibility
+        env:
+          RC_BASE_REF: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          ./scripts/check-api-compatibility.sh
+
+      - name: Upload gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rc-validation-${{ github.run_id }}
+          path: |
+            /tmp/rc-*.log
+          retention-days: 14
+          if-no-files-found: ignore

@@ -1,0 +1,94 @@
+name: Deploy Backend App
+description: Deploys a Docker image to the target environment and verifies health.
+
+inputs:
+  image_tag:
+    description: Full Docker image tag to deploy
+    required: true
+  environment:
+    description: Target environment (staging | production)
+    required: true
+  git_sha:
+    description: Git SHA being deployed
+    required: true
+  deploy_token:
+    description: Deployment platform token / webhook secret
+    required: true
+  app_url:
+    description: Base URL of the deployed app (for health check)
+    required: true
+  preview_scope:
+    description: Optional per-PR namespace for preview deployments (e.g. pr-123)
+    required: false
+    default: ""
+  stellar_network:
+    description: Stellar network the deployment must target (staging/preview must be testnet)
+    required: false
+    default: "testnet"
+
+runs:
+  using: composite
+  steps:
+    - name: Enforce testnet-only for staging/preview
+      shell: bash
+      env:
+        ENVIRONMENT: ${{ inputs.environment }}
+        STELLAR_NETWORK: ${{ inputs.stellar_network }}
+      run: |
+        # Staging and preview deployments must never connect to mainnet.
+        if [ "${ENVIRONMENT}" != "production" ] && [ "${STELLAR_NETWORK}" != "testnet" ]; then
+          echo "::error::Refusing to deploy ${ENVIRONMENT} with STELLAR_NETWORK=${STELLAR_NETWORK} (must be testnet)"
+          exit 1
+        fi
+        echo "STELLAR_NETWORK=${STELLAR_NETWORK} (environment=${ENVIRONMENT})"
+
+    - name: Trigger deployment
+      shell: bash
+      env:
+        DEPLOY_TOKEN: ${{ inputs.deploy_token }}
+        STELLAR_NETWORK: ${{ inputs.stellar_network }}
+      run: |
+        # Replace this curl with your actual deploy platform call
+        # (Render deploy hook, Railway redeploy, Fly.io deploy, etc.)
+        # The IMAGE_TAG and GIT_SHA are passed so the platform can pull the right image.
+        curl -fsSL -X POST "${{ inputs.app_url }}/_deploy" \
+          -H "Authorization: Bearer ${DEPLOY_TOKEN}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "image": "${{ inputs.image_tag }}",
+            "sha": "${{ inputs.git_sha }}",
+            "environment": "${{ inputs.environment }}",
+            "preview_scope": "${{ inputs.preview_scope }}",
+            "env": {
+              "STELLAR_NETWORK": "'"${STELLAR_NETWORK}"'",
+              "ENABLE_MAINNET_FEATURES": "false"
+            }
+          }' || true   # remove `|| true` once real endpoint is wired up
+
+    - name: Wait for health check
+      shell: bash
+      env:
+        PREVIEW_SCOPE: ${{ inputs.preview_scope }}
+      run: |
+        if [ -n "${PREVIEW_SCOPE}" ]; then
+          HEALTH_URL="${{ inputs.app_url }}/${PREVIEW_SCOPE}/health"
+        else
+          HEALTH_URL="${{ inputs.app_url }}/health"
+        fi
+        echo "Waiting for ${HEALTH_URL} ..."
+        for i in $(seq 1 24); do
+          STATUS=$(curl -o /dev/null -s -w "%{http_code}" "${HEALTH_URL}" || echo "000")
+          if [ "$STATUS" = "200" ]; then
+            echo "Health check passed (attempt ${i})"
+            exit 0
+          fi
+          echo "Attempt ${i}/24 — status ${STATUS}, retrying in 10s..."
+          sleep 10
+        done
+        echo "::error::Health check failed after 4 minutes"
+        exit 1
+
+    - name: Log release metadata
+      shell: bash
+      run: |
+        echo "::notice title=Release [${{ inputs.environment }}]::image=${{ inputs.image_tag }} | sha=${{ inputs.git_sha }} | env=${{ inputs.environment }} | preview_scope=${{ inputs.preview_scope }} | network=${{ inputs.stellar_network }} | ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"

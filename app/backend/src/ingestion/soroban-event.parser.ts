@@ -1,5 +1,6 @@
 import { Logger } from "@nestjs/common";
-import { xdr, scValToNative, Address } from "stellar-sdk";
+import { xdr, scValToNative, Address } from "@stellar/stellar-sdk";
+import { computeEventId, type EventWithoutId } from "./event-id";
 
 import type {
   QuickExContractEvent,
@@ -11,7 +12,31 @@ import type {
   ContractPausedEvent,
   AdminChangedEvent,
   ContractUpgradedEvent,
+  EphemeralKeyRegisteredEvent,
+  StealthWithdrawnEvent,
 } from "./types/contract-event.types";
+import {
+  QUICKEX_EVENT_SCHEMA_CONTRACTS,
+  QUICKEX_EVENT_TOPICS,
+  type QuickExEventTopic,
+} from "./event-schema";
+
+/** Maximum schema version this indexer understands. */
+export const MAX_SUPPORTED_SCHEMA_VERSION = 2;
+export const SUPPORTED_SCHEMA_VERSIONS = [1, 2] as const;
+
+export type UnknownSchemaVersionHandler = (
+  eventName: SorobanEventType,
+  schemaVersion: number,
+  pagingToken: string,
+) => void;
+
+export interface RawEventMetadata {
+  eventName: SorobanEventType;
+  schemaVersion: number;
+  contractId: string;
+  pagingToken: string;
+}
 
 /**
  * Raw Horizon contract event record shape (subset we need).
@@ -28,21 +53,74 @@ export interface RawHorizonContractEvent {
   value: { xdr: string }; // base64-encoded XDR ScVal
 }
 
+interface TopicLayout {
+  eventName: SorobanEventType;
+  topicNamespace: QuickExEventTopic | "LEGACY";
+  indexedOffset: number;
+}
+
 /**
  * Parses raw Horizon Soroban contract event records into typed domain events.
  *
- * Topic layout (per events-schema.md):
- *  Topic[0] = event name symbol
- *  Topic[1+] = indexed fields (commitment, owner, admin, etc.)
+ * Canonical topic layout:
+ *  Topic[0] = stable QuickEx testnet namespace (for example TOPIC_ESCROW)
+ *  Topic[1] = event name symbol
+ *  Topic[2+] = indexed fields (commitment, owner, admin, etc.)
  *
  * Data = struct with remaining fields encoded as XDR ScVal.
+ *
+ * Legacy events used Topic[0] = event name. The parser keeps a compatibility
+ * path for those events and marks them with schemaVersion=1.
  */
 export class SorobanEventParser {
   private readonly logger = new Logger(SorobanEventParser.name);
 
+  constructor(
+    private readonly onUnknownSchemaVersion?: UnknownSchemaVersionHandler,
+  ) {}
+
+  inspect(raw: RawHorizonContractEvent): RawEventMetadata | null {
+    try {
+      const topics = raw.topic.map((t) => xdr.ScVal.fromXDR(t, "base64"));
+      const dataVal = xdr.ScVal.fromXDR(raw.value.xdr, "base64");
+      const layout = this.resolveTopicLayout(topics);
+      if (!layout) return null;
+
+      return {
+        eventName: layout.eventName,
+        schemaVersion: this.extractSchemaVersionFromData(dataVal),
+        contractId: raw.contract_id,
+        pagingToken: raw.paging_token,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  isWellFormedXdr(raw: RawHorizonContractEvent): boolean {
+    try {
+      if (!Array.isArray(raw.topic) || typeof raw.value?.xdr !== "string") {
+        return false;
+      }
+      raw.topic.forEach((topic) => xdr.ScVal.fromXDR(topic, "base64"));
+      xdr.ScVal.fromXDR(raw.value.xdr, "base64");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  isSupportedSchemaVersion(
+    eventName: SorobanEventType,
+    schemaVersion: number,
+  ): boolean {
+    return this.isCompatibleSchemaVersion(eventName, schemaVersion);
+  }
+
   /**
    * Attempt to parse a raw Horizon contract event.
-   * Returns null when the event is unrecognised or malformed.
+   * Returns null when the event is unrecognised, malformed, or carries an
+   * unsupported schema version.
    */
   parse(raw: RawHorizonContractEvent): QuickExContractEvent | null {
     try {
@@ -51,35 +129,117 @@ export class SorobanEventParser {
 
       if (topics.length === 0) return null;
 
-      const eventName = this.decodeSymbol(topics[0]);
-      if (!eventName) return null;
+      const layout = this.resolveTopicLayout(topics);
+      if (!layout) return null;
+
+      const schemaVersion = this.extractSchemaVersionFromData(dataVal);
+      if (schemaVersion > MAX_SUPPORTED_SCHEMA_VERSION) {
+        this.logger.warn(
+          `Skipping event ${layout.eventName} paging_token=${raw.paging_token}: ` +
+            `schema_version=${schemaVersion} exceeds max supported (${MAX_SUPPORTED_SCHEMA_VERSION})`,
+        );
+        this.onUnknownSchemaVersion?.(
+          layout.eventName,
+          schemaVersion,
+          raw.paging_token,
+        );
+        return null;
+      }
+
+      if (
+        !this.isSupportedSchemaVersion(
+          layout.eventName,
+          schemaVersion,
+        )
+      ) {
+        this.logger.warn(
+          `Unsupported ${layout.eventName} schema version ${schemaVersion}`,
+        );
+        return null;
+      }
 
       const base = {
+        schemaVersion,
+        topicNamespace: layout.topicNamespace,
         txHash: raw.transaction_hash,
         ledgerSequence: raw.ledger,
         pagingToken: raw.paging_token,
         contractTimestamp: this.extractTimestampFromData(dataVal),
       };
 
-      switch (eventName as SorobanEventType) {
-        case "EscrowDeposited":
-          return this.parseEscrowDeposited(topics, dataVal, base);
-        case "EscrowWithdrawn":
-          return this.parseEscrowWithdrawn(topics, dataVal, base);
-        case "EscrowRefunded":
-          return this.parseEscrowRefunded(topics, dataVal, base);
-        case "PrivacyToggled":
-          return this.parsePrivacyToggled(topics, dataVal, base);
-        case "ContractPaused":
-          return this.parseContractPaused(topics, dataVal, base);
-        case "AdminChanged":
-          return this.parseAdminChanged(topics, dataVal, base);
-        case "ContractUpgraded":
-          return this.parseContractUpgraded(topics, dataVal, base);
-        default:
-          this.logger.debug(`Unrecognised event name: ${eventName}`);
-          return null;
-      }
+      const built = ((): EventWithoutId | null => {
+        switch (layout.eventName) {
+          case "EscrowDeposited":
+            return this.parseEscrowDeposited(
+              topics,
+              dataVal,
+              base,
+              layout.indexedOffset,
+            );
+          case "EscrowWithdrawn":
+            return this.parseEscrowWithdrawn(
+              topics,
+              dataVal,
+              base,
+              layout.indexedOffset,
+            );
+          case "EscrowRefunded":
+            return this.parseEscrowRefunded(
+              topics,
+              dataVal,
+              base,
+              layout.indexedOffset,
+            );
+          case "PrivacyToggled":
+            return this.parsePrivacyToggled(
+              topics,
+              dataVal,
+              base,
+              layout.indexedOffset,
+            );
+          case "ContractPaused":
+            return this.parseContractPaused(
+              topics,
+              dataVal,
+              base,
+              layout.indexedOffset,
+            );
+          case "AdminChanged":
+            return this.parseAdminChanged(
+              topics,
+              dataVal,
+              base,
+              layout.indexedOffset,
+            );
+          case "ContractUpgraded":
+            return this.parseContractUpgraded(
+              topics,
+              dataVal,
+              base,
+              layout.indexedOffset,
+            );
+          case "EphemeralKeyRegistered":
+            return this.parseEphemeralKeyRegistered(
+              topics,
+              dataVal,
+              base,
+              layout.indexedOffset,
+            );
+          case "StealthWithdrawn":
+            return this.parseStealthWithdrawn(
+              topics,
+              dataVal,
+              base,
+              layout.indexedOffset,
+            );
+          default:
+            this.logger.debug(`Unrecognised event name: ${layout.eventName}`);
+            return null;
+        }
+      })();
+
+      if (!built) return null;
+      return { ...built, eventId: computeEventId(built) } as QuickExContractEvent;
     } catch (err) {
       this.logger.warn(
         `Failed to parse contract event ${raw.paging_token}: ${(err as Error).message}`,
@@ -97,12 +257,19 @@ export class SorobanEventParser {
     data: xdr.ScVal,
     base: Omit<
       EscrowDepositedEvent,
-      "eventType" | "commitment" | "owner" | "token" | "amount" | "expiresAt"
+      | "eventId"
+      | "eventType"
+      | "commitment"
+      | "owner"
+      | "token"
+      | "amount"
+      | "amountPaid"
+      | "expiresAt"
     >,
-  ): EscrowDepositedEvent {
-    // Topics: [name, commitment, owner]
-    const commitment = this.decodeBytes32Hex(topics[1]);
-    const owner = this.decodeAddress(topics[2]);
+    indexedOffset: number,
+  ): Omit<EscrowDepositedEvent, "eventId"> {
+    const commitment = this.decodeBytes32Hex(topics[indexedOffset]);
+    const owner = this.decodeAddress(topics[indexedOffset + 1]);
     const map = this.dataToMap(data);
 
     return {
@@ -111,7 +278,8 @@ export class SorobanEventParser {
       commitment,
       owner,
       token: this.decodeAddress(map["token"]),
-      amount: BigInt(scValToNative(map["amount"])),
+      amount: BigInt(scValToNative(map["amount_due"] ?? map["amount"])),
+      amountPaid: BigInt(scValToNative(map["amount_paid"] ?? map["amount"])),
       expiresAt: BigInt(scValToNative(map["expires_at"])),
     };
   }
@@ -121,11 +289,12 @@ export class SorobanEventParser {
     data: xdr.ScVal,
     base: Omit<
       EscrowWithdrawnEvent,
-      "eventType" | "commitment" | "owner" | "token" | "amount"
+      "eventId" | "eventType" | "commitment" | "owner" | "token" | "amount"
     >,
-  ): EscrowWithdrawnEvent {
-    const commitment = this.decodeBytes32Hex(topics[1]);
-    const owner = this.decodeAddress(topics[2]);
+    indexedOffset: number,
+  ): Omit<EscrowWithdrawnEvent, "eventId"> {
+    const commitment = this.decodeBytes32Hex(topics[indexedOffset]);
+    const owner = this.decodeAddress(topics[indexedOffset + 1]);
     const map = this.dataToMap(data);
 
     return {
@@ -143,11 +312,12 @@ export class SorobanEventParser {
     data: xdr.ScVal,
     base: Omit<
       EscrowRefundedEvent,
-      "eventType" | "commitment" | "owner" | "token" | "amount"
+      "eventId" | "eventType" | "commitment" | "owner" | "token" | "amount"
     >,
-  ): EscrowRefundedEvent {
-    const commitment = this.decodeBytes32Hex(topics[1]);
-    const owner = this.decodeAddress(topics[2]);
+    indexedOffset: number,
+  ): Omit<EscrowRefundedEvent, "eventId"> {
+    const commitment = this.decodeBytes32Hex(topics[indexedOffset]);
+    const owner = this.decodeAddress(topics[indexedOffset + 1]);
     const map = this.dataToMap(data);
 
     return {
@@ -167,9 +337,10 @@ export class SorobanEventParser {
   private parsePrivacyToggled(
     topics: xdr.ScVal[],
     data: xdr.ScVal,
-    base: Omit<PrivacyToggledEvent, "eventType" | "owner" | "enabled">,
-  ): PrivacyToggledEvent {
-    const owner = this.decodeAddress(topics[1]);
+    base: Omit<PrivacyToggledEvent, "eventId" | "eventType" | "owner" | "enabled">,
+    indexedOffset: number,
+  ): Omit<PrivacyToggledEvent, "eventId"> {
+    const owner = this.decodeAddress(topics[indexedOffset]);
     const map = this.dataToMap(data);
 
     return {
@@ -183,9 +354,10 @@ export class SorobanEventParser {
   private parseContractPaused(
     topics: xdr.ScVal[],
     data: xdr.ScVal,
-    base: Omit<ContractPausedEvent, "eventType" | "admin" | "paused">,
-  ): ContractPausedEvent {
-    const admin = this.decodeAddress(topics[1]);
+    base: Omit<ContractPausedEvent, "eventId" | "eventType" | "admin" | "paused">,
+    indexedOffset: number,
+  ): Omit<ContractPausedEvent, "eventId"> {
+    const admin = this.decodeAddress(topics[indexedOffset]);
     const map = this.dataToMap(data);
 
     return {
@@ -199,10 +371,11 @@ export class SorobanEventParser {
   private parseAdminChanged(
     topics: xdr.ScVal[],
     data: xdr.ScVal,
-    base: Omit<AdminChangedEvent, "eventType" | "oldAdmin" | "newAdmin">,
-  ): AdminChangedEvent {
-    const oldAdmin = this.decodeAddress(topics[1]);
-    const newAdmin = this.decodeAddress(topics[2]);
+    base: Omit<AdminChangedEvent, "eventId" | "eventType" | "oldAdmin" | "newAdmin">,
+    indexedOffset: number,
+  ): Omit<AdminChangedEvent, "eventId"> {
+    const oldAdmin = this.decodeAddress(topics[indexedOffset]);
+    const newAdmin = this.decodeAddress(topics[indexedOffset + 1]);
 
     return {
       eventType: "AdminChanged",
@@ -215,16 +388,74 @@ export class SorobanEventParser {
   private parseContractUpgraded(
     topics: xdr.ScVal[],
     data: xdr.ScVal,
-    base: Omit<ContractUpgradedEvent, "eventType" | "newWasmHash" | "admin">,
-  ): ContractUpgradedEvent {
-    const newWasmHash = this.decodeBytes32Hex(topics[1]);
-    const admin = this.decodeAddress(topics[2]);
+    base: Omit<ContractUpgradedEvent, "eventId" | "eventType" | "newWasmHash" | "admin">,
+    indexedOffset: number,
+  ): Omit<ContractUpgradedEvent, "eventId"> {
+    const newWasmHash = this.decodeBytes32Hex(topics[indexedOffset]);
+    const admin = this.decodeAddress(topics[indexedOffset + 1]);
 
     return {
       eventType: "ContractUpgraded",
       ...base,
       newWasmHash,
       admin,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Stealth address event parsers (Privacy v2 – Issue #157)
+  // ---------------------------------------------------------------------------
+
+  private parseEphemeralKeyRegistered(
+    topics: xdr.ScVal[],
+    data: xdr.ScVal,
+    base: Omit<
+      EphemeralKeyRegisteredEvent,
+      | "eventId"
+      | "eventType"
+      | "stealthAddress"
+      | "ephPub"
+      | "token"
+      | "amount"
+      | "expiresAt"
+    >,
+    indexedOffset: number,
+  ): Omit<EphemeralKeyRegisteredEvent, "eventId"> {
+    const stealthAddress = this.decodeBytes32Hex(topics[indexedOffset]);
+    const ephPub = this.decodeBytes32Hex(topics[indexedOffset + 1]);
+    const map = this.dataToMap(data);
+
+    return {
+      eventType: "EphemeralKeyRegistered",
+      ...base,
+      stealthAddress,
+      ephPub,
+      token: this.decodeAddress(map["token"]),
+      amount: BigInt(scValToNative(map["amount_due"] ?? map["amount"])),
+      expiresAt: BigInt(scValToNative(map["expires_at"])),
+    };
+  }
+
+  private parseStealthWithdrawn(
+    topics: xdr.ScVal[],
+    data: xdr.ScVal,
+    base: Omit<
+      StealthWithdrawnEvent,
+      "eventId" | "eventType" | "stealthAddress" | "recipient" | "token" | "amount"
+    >,
+    indexedOffset: number,
+  ): Omit<StealthWithdrawnEvent, "eventId"> {
+    const stealthAddress = this.decodeBytes32Hex(topics[indexedOffset]);
+    const recipient = this.decodeAddress(topics[indexedOffset + 1]);
+    const map = this.dataToMap(data);
+
+    return {
+      eventType: "StealthWithdrawn",
+      ...base,
+      stealthAddress,
+      recipient,
+      token: this.decodeAddress(map["token"]),
+      amount: BigInt(scValToNative(map["amount"])),
     };
   }
 
@@ -238,6 +469,55 @@ export class SorobanEventParser {
     } catch {
       return null;
     }
+  }
+
+  private resolveTopicLayout(topics: xdr.ScVal[]): TopicLayout | null {
+    const first = this.decodeSymbol(topics[0]);
+    if (!first) return null;
+
+    const canonicalTopics = new Set<string>(
+      Object.values(QUICKEX_EVENT_TOPICS),
+    );
+    if (canonicalTopics.has(first)) {
+      const second = topics[1] ? this.decodeSymbol(topics[1]) : null;
+      if (!second || !(second in QUICKEX_EVENT_SCHEMA_CONTRACTS)) return null;
+
+      const contract =
+        QUICKEX_EVENT_SCHEMA_CONTRACTS[
+          second as keyof typeof QUICKEX_EVENT_SCHEMA_CONTRACTS
+        ];
+      if (contract.topic !== first) return null;
+
+      return {
+        eventName: second as SorobanEventType,
+        topicNamespace: first as QuickExEventTopic,
+        indexedOffset: 2,
+      };
+    }
+
+    if (first in QUICKEX_EVENT_SCHEMA_CONTRACTS) {
+      return {
+        eventName: first as SorobanEventType,
+        topicNamespace: "LEGACY",
+        indexedOffset: 1,
+      };
+    }
+
+    return null;
+  }
+
+  private isCompatibleSchemaVersion(
+    eventName: SorobanEventType,
+    schemaVersion: number,
+  ): boolean {
+    const contract =
+      QUICKEX_EVENT_SCHEMA_CONTRACTS[
+        eventName as keyof typeof QUICKEX_EVENT_SCHEMA_CONTRACTS
+      ];
+
+    return (contract.compatibleVersions as readonly number[]).includes(
+      schemaVersion,
+    );
   }
 
   private decodeAddress(val: xdr.ScVal): string {
@@ -267,6 +547,18 @@ export class SorobanEventParser {
     return result;
   }
 
+  private extractSchemaVersionFromData(data: xdr.ScVal): number {
+    try {
+      const map = this.dataToMap(data);
+      if (map["schema_version"]) {
+        return Number(scValToNative(map["schema_version"]));
+      }
+    } catch {
+      // Legacy events did not include schema_version.
+    }
+    return 1;
+  }
+
   private extractTimestampFromData(data: xdr.ScVal): bigint {
     try {
       const map = this.dataToMap(data);
@@ -278,4 +570,5 @@ export class SorobanEventParser {
     }
     return 0n;
   }
+
 }
