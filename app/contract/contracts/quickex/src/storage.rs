@@ -110,6 +110,8 @@ pub const PRIVACY_ENABLED_KEY: &str = "privacy_enabled";
 
 pub const LEGACY_CONTRACT_VERSION: u32 = 0;
 pub const CURRENT_CONTRACT_VERSION: u32 = 1;
+pub const LEGACY_SCHEMA_VERSION: u32 = 0;
+pub const SCHEMA_VERSION: u32 = 1;
 
 pub const LEDGER_THRESHOLD: u32 = 17280; // ~1 day
 pub const SIX_MONTHS_IN_LEDGERS: u32 = 3110400; // ~185 days
@@ -230,6 +232,8 @@ pub enum DataKey {
     AdminApprovalReady,
     /// Round in which an address last approved an admin action.
     AdminSignerApprovalRound(Address),
+    /// Stored contract storage schema version (singleton).
+    SchemaVersion,
 }
 
 /// Compact escrow record stored on the hot path.
@@ -597,10 +601,14 @@ pub fn assert_post_upgrade_invariants(env: &Env) -> Result<(), &'static str> {
         return Err("fee_bps exceeds maximum (10000)");
     }
 
-    // Invariant 2: Contract version must be set to CURRENT.
+    // Invariant 2: Contract and schema version must be set to CURRENT / SCHEMA_VERSION.
     let version = get_contract_version(env);
     if version != Some(CURRENT_CONTRACT_VERSION) {
         return Err("contract version not set to current after migration");
+    }
+    let schema_version = get_schema_version(env);
+    if schema_version != Some(SCHEMA_VERSION) {
+        return Err("schema version not set to current after migration");
     }
 
     // Invariant 3: Admin must be initialized.
@@ -686,6 +694,21 @@ pub fn has_escrow(env: &Env, commitment: &Bytes) -> bool {
             .has(&legacy_escrow_key(commitment))
 }
 
+/// Migrate a legacy `DataKey::Escrow(commitment)` record to the compact v1
+/// schema (`DataKey::EscrowCore` + optional `DataKey::EscrowDispute`).
+///
+/// Idempotent: returns `true` when a legacy record was transformed, or `false`
+/// if the record was already migrated or does not exist.
+pub fn migrate_legacy_escrow_record(env: &Env, commitment: &Bytes) -> bool {
+    let legacy_key = legacy_escrow_key(commitment);
+    let legacy_entry: Option<EscrowEntry> = env.storage().persistent().get(&legacy_key);
+    if let Some(entry) = legacy_entry {
+        put_escrow(env, commitment, &entry);
+        return true;
+    }
+    false
+}
+
 /// Extend the TTL of whichever escrow representation is currently stored.
 pub fn extend_escrow_storage_ttl(env: &Env, commitment: &Bytes) -> bool {
     extend_escrow_compaction_ttl(env, commitment)
@@ -739,10 +762,32 @@ pub fn increment_escrow_counter(env: &Env) -> u64 {
 }
 
 pub fn get_contract_version(env: &Env) -> Option<u32> {
-    env.storage().persistent().get(&DataKey::ContractVersion)
+    env.storage()
+        .persistent()
+        .get(&DataKey::ContractVersion)
+        .or_else(|| env.storage().persistent().get(&DataKey::SchemaVersion))
 }
 
 pub fn set_contract_version(env: &Env, version: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::ContractVersion, &version);
+    env.storage()
+        .persistent()
+        .set(&DataKey::SchemaVersion, &version);
+}
+
+pub fn get_schema_version(env: &Env) -> Option<u32> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SchemaVersion)
+        .or_else(|| env.storage().persistent().get(&DataKey::ContractVersion))
+}
+
+pub fn set_schema_version(env: &Env, version: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::SchemaVersion, &version);
     env.storage()
         .persistent()
         .set(&DataKey::ContractVersion, &version);

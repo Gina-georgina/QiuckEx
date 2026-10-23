@@ -5,7 +5,6 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import AnalyticsDashboard from "@/components/AnalyticsDashboard";
 import { NetworkBadge } from "@/components/NetworkBadge";
-import { useApi } from "@/hooks/useApi";
 import { fetchAnalytics, type AnalyticsData } from "@/hooks/analyticsApi";
 import {
   fetchUserBids,
@@ -15,8 +14,10 @@ import {
   type UserListing,
 } from "@/hooks/marketplaceApi";
 import {
+  appendUniqueActivityItems,
   fetchActivityFeed,
   type ActivityFeedItem,
+  type ActivityFeedResponse,
 } from "@/hooks/activityFeedApi";
 import {
   filterActivityItems,
@@ -25,11 +26,8 @@ import {
 } from "@/lib/activityFilters";
 import { PaymentHistoryFilters } from "@/components/PaymentHistoryFilters";
 import { cacheInvalidator } from "@/lib/cacheInvalidation";
-
-type DashboardResponse = {
-  items: ActivityFeedItem[];
-  degraded: boolean;
-};
+import { PaymentWizard } from "@/components/PaymentWizard/PaymentWizard";
+import { DashboardSkeleton } from "@/components/skeletons/Skeletons";
 
 function toAnchorId(prefix: string, value: string) {
   return `${prefix}-${value.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
@@ -65,7 +63,10 @@ function formatCurrency(val: number): string {
 
 function DashboardContent() {
   const searchParams = useSearchParams();
-  const { data, error, loading, callApi } = useApi<DashboardResponse>();
+  const [data, setData] = useState<ActivityFeedResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [userBids, setUserBids] = useState<UserBid[]>([]);
   const [userListings, setUserListings] = useState<UserListing[]>([]);
   const [bidsLoading, setBidsLoading] = useState(true);
@@ -74,6 +75,24 @@ function DashboardContent() {
   const [listingsError, setListingsError] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [feedRetryCount, setFeedRetryCount] = useState(0);
+  const [wizardOpen, setWizardOpen] = useState(false);
+
+  const refreshActivity = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const refreshed = await fetchActivityFeed(20);
+      setData((current) =>
+        refreshed.degraded && current
+          ? { ...current, degraded: true, error: refreshed.error }
+          : refreshed,
+      );
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Activity could not be loaded.");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   const [metricsData, setMetricsData] = useState<AnalyticsData | null>(null);
   const [metricsLoading, setMetricsLoading] = useState(true);
@@ -103,7 +122,7 @@ function DashboardContent() {
   }, [loadMetrics]);
 
   useEffect(() => {
-    void callApi(() => fetchActivityFeed(20));
+    void refreshActivity();
     void fetchUserBids().then(setUserBids);
     void fetchUserListings().then(setUserListings);
 
@@ -113,12 +132,12 @@ function DashboardContent() {
         event.type === "link_created" ||
         event.type === "activity_feed_cleared"
       ) {
-        void callApi(() => fetchActivityFeed(20));
+        void refreshActivity();
         void loadMetrics();
       }
     });
     return () => unsubscribe();
-  }, [callApi, feedRetryCount, loadMetrics]);
+  }, [feedRetryCount, loadMetrics, refreshActivity]);
 
   useEffect(() => {
     if (!statusMessage) {
@@ -223,15 +242,24 @@ function DashboardContent() {
     setFeedRetryCount((prev) => prev + 1);
   };
 
+  const handleLoadMore = async () => {
+    if (!data?.nextCursor || loadingMore) return;
+    const previousData = data;
+    setLoadingMore(true);
+    try {
+      const nextPage = await fetchActivityFeed(20, previousData.nextCursor);
+      setData({
+        ...nextPage,
+        items: appendUniqueActivityItems(previousData.items, nextPage.items),
+        nextCursor: nextPage.degraded ? previousData.nextCursor : nextPage.nextCursor,
+      });
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
   if (loading) {
-    return (
-      <div className="flex min-h-[60vh] items-center justify-center">
-        <div className="text-center">
-          <div className="mb-4 h-8 w-8 animate-spin rounded-full border-2 border-indigo-500 border-t-transparent mx-auto" />
-          <p className="text-muted">Loading dashboard...</p>
-        </div>
-      </div>
-    );
+    return <DashboardSkeleton />;
   }
 
   if (error) {
@@ -331,6 +359,13 @@ function DashboardContent() {
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={() => setWizardOpen(true)}
+              className={`rounded-md bg-emerald-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-emerald-700 ${FOCUS_RING_CLASS}`}
+            >
+              Create payment link
+            </button>
             <Link
               href="/notifications"
               className={`rounded-xl border border-border-strong bg-surface px-4 py-3 text-sm font-semibold text-foreground transition hover:bg-surface-strong ${FOCUS_RING_CLASS}`}
@@ -359,14 +394,17 @@ function DashboardContent() {
             {statusMessage ??
               "Notifications can jump you directly into payments, active bids, and listing updates."}
           </p>
+          {wizardOpen ? (
+            <PaymentWizard onClose={() => setWizardOpen(false)} />
+          ) : null}
         </div>
 
         <section className="mb-10 grid grid-cols-1 gap-6 sm:grid-cols-2 md:mb-16 lg:grid-cols-3">
           {metricsLoading ? (
             <>
-              <div className="h-36 animate-pulse rounded-3xl border border-border bg-card p-6" />
-              <div className="h-36 animate-pulse rounded-3xl border border-border bg-card p-6" />
-              <div className="h-36 animate-pulse rounded-3xl border border-indigo-300/50 bg-indigo-500/50 p-6" />
+              <div aria-hidden="true" className="h-36 animate-pulse rounded-3xl border border-border bg-card p-6" />
+              <div aria-hidden="true" className="h-36 animate-pulse rounded-3xl border border-border bg-card p-6" />
+              <div aria-hidden="true" className="h-36 animate-pulse rounded-3xl border border-indigo-300/50 bg-indigo-500/50 p-6" />
             </>
           ) : metricsError ? (
             <div className="col-span-full rounded-3xl border border-red-500/20 bg-surface p-6 text-center">
@@ -512,12 +550,13 @@ function DashboardContent() {
                 detected on the Stellar network. Create a payment link to get
                 started.
               </p>
-              <Link
-                href="/generator"
-                className={`mt-6 rounded-xl bg-indigo-500 px-5 py-2.5 text-sm font-semibold text-white shadow-lg transition hover:bg-indigo-400 ${FOCUS_RING_CLASS}`}
+              <button
+                type="button"
+                onClick={() => setWizardOpen(true)}
+                className={`mt-6 rounded-md bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-emerald-700 ${FOCUS_RING_CLASS}`}
               >
                 Create payment link
-              </Link>
+              </button>
             </div>
           ) : data.degraded && data.items.length === 0 ? (
             <div className="px-6 py-12 text-center sm:px-10">
@@ -578,6 +617,16 @@ function DashboardContent() {
                   >
                     Clear filters
                   </button>
+                  {data?.nextCursor ? (
+                    <button
+                      type="button"
+                      onClick={handleLoadMore}
+                      disabled={loadingMore}
+                      className={`mt-3 rounded-xl border border-border bg-card px-4 py-2 text-sm font-semibold text-foreground transition hover:border-indigo-300/40 disabled:opacity-50 ${FOCUS_RING_CLASS}`}
+                    >
+                      {loadingMore ? "Loading payments..." : "Load more payments"}
+                    </button>
+                  ) : null}
                 </div>
               ) : (
                 <>
@@ -671,7 +720,17 @@ function DashboardContent() {
                     </table>
                   </div>
 
-                  <div className="bg-surface p-6 text-center sm:p-8">
+                  <div className="flex flex-col items-center gap-4 bg-surface p-6 text-center sm:p-8">
+                    {data?.nextCursor ? (
+                      <button
+                        type="button"
+                        onClick={handleLoadMore}
+                        disabled={loadingMore}
+                        className={`rounded-xl border border-border bg-card px-4 py-2 text-sm font-semibold text-foreground transition hover:border-indigo-300/40 disabled:opacity-50 ${FOCUS_RING_CLASS}`}
+                      >
+                        {loadingMore ? "Loading payments..." : "Load more payments"}
+                      </button>
+                    ) : null}
                     <Link
                       href="/notifications?category=payments"
                       className={`text-sm font-semibold text-muted transition hover:text-foreground ${FOCUS_RING_CLASS}`}
@@ -825,7 +884,7 @@ function DashboardContent() {
 export default function Dashboard() {
   return (
     <Suspense
-      fallback={<p className="text-muted">Loading dashboard...</p>}
+      fallback={<DashboardSkeleton />}
     >
       <DashboardContent />
     </Suspense>

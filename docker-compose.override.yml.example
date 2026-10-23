@@ -1,0 +1,19 @@
+# Copy to docker-compose.override.yml (git-ignored) for developer-specific tweaks.
+# Docker Compose merges it automatically on `docker compose up`.
+
+services:
+  backend:
+    environment:
+      LOG_LEVEL: debug
+      # STELLAR_NETWORK: testnet
+    # ports:
+    #   - "9229:9229"   # Node inspector
+    # command: sh -c "npm install && npm run start:debug"
+
+  frontend:
+    ports:
+      - "3001:3000"   # expose on a different host port
+
+  # supabase-db:
+  #   ports:
+  #     - "5432:5432"

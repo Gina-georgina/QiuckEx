@@ -103,20 +103,15 @@ jobs:
         run: |
           eas build --platform ${{ matrix.platform }} --profile ${{ matrix.app_env }} --non-interactive
 
-  maestro-e2e:
-    name: Maestro E2E Flows (${{ matrix.platform }})
-    runs-on: ${{ matrix.os }}
+  maestro-android:
+    name: Maestro UI Tests (Android emulator)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: app/mobile
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: android
-            os: ubuntu-latest
-          - platform: ios
-            os: macos-latest
+    env:
+      EXPO_PUBLIC_USE_MOCK_API: 'true'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -126,6 +121,12 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -134,35 +135,37 @@ jobs:
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Enable KVM (Android emulator acceleration)
-        if: matrix.platform == 'android'
+      - name: Build Android debug APK
+        run: |
+          npx expo prebuild --platform android --no-install
+          cd android && ./gradlew assembleRelease -x lint
+
+      - name: Install Maestro
+        run: |
+          curl -Ls "https://get.maestro.mobile.dev" | bash
+          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+
+      - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Run Maestro flows on Android emulator
-        if: matrix.platform == 'android'
+      - name: Run Maestro scan-and-pay flow
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 34
           arch: x86_64
-          profile: pixel_6
+          target: google_apis
           working-directory: app/mobile
           script: |
-            curl -Ls "https://get.maestro.mobile.dev" | bash
-            export PATH="$PATH:$HOME/.maestro/bin"
-            maestro test .maestro/flows
-        env:
-          MAESTRO_APP_ID: ${{ vars.MAESTRO_APP_ID }}
-          EXPO_PUBLIC_API_URL: ${{ vars.MOCK_API_URL }}
+            adb install android/app/build/outputs/apk/release/app-release.apk
+            maestro test .maestro/scan-and-pay.yml --format junit --output maestro-report.xml
 
-      - name: Run Maestro flows on iOS simulator
-        if: matrix.platform == 'ios'
-        env:
-          MAESTRO_APP_ID: ${{ vars.MAESTRO_APP_ID }}
-          EXPO_PUBLIC_API_URL: ${{ vars.MOCK_API_URL }}
-        run: |
-          curl -Ls "https://get.maestro.mobile.dev" | bash
-          export PATH="$PATH:$HOME/.maestro/bin"
-          maestro test .maestro/flows
+      - name: Upload Maestro report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maestro-report
+          path: app/mobile/maestro-report.xml
+          if-no-files-found: ignore

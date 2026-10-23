@@ -60,6 +60,8 @@ Notes on the layout:
 
 ## Setup Instructions
 
+> New contributor? Start with the [contributor onboarding guide](docs/CONTRIBUTOR-ONBOARDING.md) for a clean setup, local payment flow, tests, and troubleshooting.
+
 ### Prerequisites
 Before getting started, ensure you have the following installed:
 - Node.js 20+ ([nodejs.org](https://nodejs.org)). This matches the version used in CI (`.github/workflows/ci.yml`).
@@ -251,3 +253,11 @@ This project is licensed under the MIT License.
 - Have questions? Open an issue or DM @pulsefy.
 
 Built with ❤️ by Pulsefy. Powered by Stellar. 🚀
+
+## Handsoff notes
+
+<!-- handsoff-issue-371 -->
+- #371: feat(contract): Add contract upgrade safety gate with version registry
+
+<!-- handsoff-issue-462 -->
+- #462: [Docs] Update CAPABILITY-MAP.md to reflect current feature flag states

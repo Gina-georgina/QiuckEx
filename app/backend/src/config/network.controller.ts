@@ -1,4 +1,4 @@
-import { Controller, Get } from '@nestjs/common';
+import { Controller, Get, Logger } from '@nestjs/common';
 import { ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
 import { AppConfigService } from './app-config.service';
@@ -56,8 +56,8 @@ export class NetworkController {
     if (flagsJson) {
       try {
         featureFlags = JSON.parse(flagsJson);
-      } catch (error) {
-        console.warn('Failed to parse FEATURE_FLAGS_BOOTSTRAP_JSON', error);
+      } catch {
+        Logger.warn('Failed to parse FEATURE_FLAGS_BOOTSTRAP_JSON', 'NetworkController');
       }
     }
 

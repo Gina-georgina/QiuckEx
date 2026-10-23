@@ -53,3 +53,17 @@ NEXT_PUBLIC_STELLAR_NETWORK=testnet  # 'testnet' or 'mainnet'
 - Added route-based skeleton loaders for `/dashboard` and `/marketplace`.
 - Prefetched likely next routes and mock data from the landing page to improve time-to-interactive.
 - Added memoized mock caches for analytics and marketplace calls to reduce repeated client work during navigation.
+
+## Component library (Storybook)
+
+Shared UI components (Button, Input, Modal, Toast, Badge, Avatar, QRCode,
+TransactionRow) and the design tokens are documented in Storybook.
+
+- **Live:** https://viky207.github.io/QiuckEx/ (deployed from `main` by `.github/workflows/storybook.yml`)
+- **Local:** `pnpm --filter frontend storybook` → http://localhost:6006
+- **Static build:** `pnpm --filter frontend build-storybook`
+
+Stories live in `src/stories/`. Design tokens are exported from
+`src/design-tokens.ts`, which reads `packages/design-tokens/tokens.json` — the
+same source as `tailwind.config.ts` — so tokens and Tailwind classes stay in sync.
+When you add a shared component under `src/components/ui/`, add a story for it.

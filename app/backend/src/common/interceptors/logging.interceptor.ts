@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { Observable } from 'rxjs';
 import { tap } from 'rxjs/operators';
+import { createHash } from 'crypto';
 import { getCorrelationId } from '../context/correlation.context';
 
 /**
@@ -50,7 +51,11 @@ export class LoggingInterceptor implements NestInterceptor {
       (request as Record<string, unknown>)['correlationId'] ||
       'N/A';
     const userId = this.extractUserId(request);
-    const routePath = route?.path || url;
+    const hashedUserId = userId
+      ? createHash('sha256').update(userId).digest('hex')
+      : undefined;
+    const safeUrl = typeof url === 'string' ? url.split('?')[0] : url;
+    const routePath = route?.path || safeUrl;
     const now = Date.now();
 
     const sanitizedBody = this.sanitise(body);
@@ -61,11 +66,12 @@ export class LoggingInterceptor implements NestInterceptor {
           const duration = Date.now() - now;
           this.logger.log(
             JSON.stringify({
+              requestId: correlationId,
               correlationId,
-              userId,
+              userId: hashedUserId,
               route: routePath,
               method,
-              url,
+              url: safeUrl,
               duration: `${duration}ms`,
               body: sanitizedBody,
               status: 'success',
@@ -78,11 +84,12 @@ export class LoggingInterceptor implements NestInterceptor {
             error instanceof HttpException ? error.getStatus() : 500;
           this.logger.error(
             JSON.stringify({
+              requestId: correlationId,
               correlationId,
-              userId,
+              userId: hashedUserId,
               route: routePath,
               method,
-              url,
+              url: safeUrl,
               duration: `${duration}ms`,
               status: 'error',
               statusCode,
