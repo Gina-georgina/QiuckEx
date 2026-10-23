@@ -1,5 +1,7 @@
 name: Dependency Review
 
+# Runs on every PR to main, including all Dependabot PRs, and is a required
+# check before Dependabot auto-merge can complete.
 on:
   pull_request:
     branches:

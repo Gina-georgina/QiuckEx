@@ -1,0 +1,113 @@
+# Full local development stack for QuickEx.
+#   docker compose up            # start everything (hot-reload enabled)
+#   docker compose down -v       # stop and delete all local data
+# See docs/LOCAL-DEV.md for details.
+
+x-node-dev: &node-dev
+  image: node:20-alpine
+  working_dir: /workspace
+  environment: &node-env
+    CHOKIDAR_USEPOLLING: "true"
+    WATCHPACK_POLLING: "true"
+
+services:
+  supabase-db:
+    image: supabase/postgres:15.8.1.060
+    restart: unless-stopped
+    ports:
+      - "54322:5432"
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - supabase-db-data:/var/lib/postgresql/data
+      - ./scripts/local-dev/seed.sql:/docker-entrypoint-initdb.d/99-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -h localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  supabase-auth:
+    image: supabase/gotrue:v2.177.0
+    restart: unless-stopped
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    ports:
+      - "9999:9999"
+    environment:
+      API_EXTERNAL_URL: http://localhost:9999
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:postgres@supabase-db:5432/postgres
+      GOTRUE_SITE_URL: http://localhost:3000
+      GOTRUE_JWT_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_DISABLE_SIGNUP: "false"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    <<: *node-dev
+    working_dir: /workspace/app/backend
+    command: sh -c "npm install --no-audit --no-fund && npm run start:dev"
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+    environment:
+      <<: *node-env
+      NODE_ENV: development
+      PORT: 4000
+      DATABASE_URL: postgresql://postgres:postgres@supabase-db:5432/postgres
+      SUPABASE_URL: http://supabase-auth:9999
+      REDIS_URL: redis://redis:6379
+    volumes:
+      - ./:/workspace
+      - backend-node-modules:/workspace/app/backend/node_modules
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  frontend:
+    <<: *node-dev
+    working_dir: /workspace/app/frontend
+    command: sh -c "npm install --no-audit --no-fund && npx next dev -H 0.0.0.0 -p 3000"
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+    environment:
+      <<: *node-env
+      NEXT_PUBLIC_API_URL: http://localhost:4000
+    volumes:
+      - ./:/workspace
+      - frontend-node-modules:/workspace/app/frontend/node_modules
+      - frontend-next:/workspace/app/frontend/.next
+
+volumes:
+  supabase-db-data:
+  redis-data:
+  backend-node-modules:
+  frontend-node-modules:
+  frontend-next:
