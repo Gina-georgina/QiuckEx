@@ -1,8 +1,9 @@
-import { Injectable, OnModuleInit } from "@nestjs/common";
+import { Injectable, Logger, OnModuleInit } from "@nestjs/common";
 import * as client from "prom-client";
 
 @Injectable()
 export class MetricsService implements OnModuleInit {
+  private readonly logger = new Logger(MetricsService.name);
   private register: client.Registry;
   private httpRequestDuration: client.Histogram<string>;
   private httpRequestTotal: client.Counter<string>;
@@ -371,8 +372,8 @@ export class MetricsService implements OnModuleInit {
       this.register.registerMetric(this.testnetFixtureDuration);
 
       this.initialized = true;
-    } catch (error) {
-      console.error("Failed to initialize metrics:", error);
+    } catch {
+      this.logger.error("Failed to initialize metrics");
       this.initialized = false;
     }
   }

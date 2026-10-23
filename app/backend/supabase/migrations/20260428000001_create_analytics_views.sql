@@ -103,9 +103,9 @@ GROUP BY si.organization_id, dm.metric_date, dm.asset_code, dm.asset_issuer,
 CREATE OR REPLACE FUNCTION refresh_analytics_views()
 RETURNS void AS $$
 BEGIN
-  REFRESH MATERIALIZED VIEW CONCURRENTLY daily_metrics;
-  REFRESH MATERIALIZED VIEW CONCURRENTLY weekly_metrics;
-  REFRESH MATERIALIZED VIEW CONCURRENTLY monthly_metrics;
+  REFRESH MATERIALIZED VIEW daily_metrics;
+  REFRESH MATERIALIZED VIEW weekly_metrics;
+  REFRESH MATERIALIZED VIEW monthly_metrics;
 END;
 $$ LANGUAGE plpgsql;
 

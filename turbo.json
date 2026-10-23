@@ -42,6 +42,9 @@
         "build"
       ],
       "outputs": []
+    },
+    "db:migrate": {
+      "cache": false
     }
   }
 }

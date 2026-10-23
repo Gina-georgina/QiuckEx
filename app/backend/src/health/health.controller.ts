@@ -14,6 +14,16 @@ import { ApiErrorResponse } from "../common/decorators/api-error-response.decora
 export class HealthController {
   constructor(private readonly healthService: HealthService) {}
 
+  @Get("health/live")
+  @ApiOperation({
+    summary: "Liveness check",
+    description: "Returns 200 when the application process is running.",
+  })
+  @ApiResponse({ status: 200, schema: { example: { status: "ok" } } })
+  getLiveness(@Res() res: Response) {
+    return res.status(200).json({ status: "ok" });
+  }
+
   @Get("health")
   @ApiOperation({
     summary: "Health check",
