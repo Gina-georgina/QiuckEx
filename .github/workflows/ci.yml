@@ -51,7 +51,7 @@ jobs:
         if: matrix.package == '@quickex/backend'
         run: |
           pnpm check:contract-metadata-drift
-          node --test scripts/check-contract-metadata-drift.test.js scripts/verify-mainnet-deployment-gate.test.js
+          node --test scripts/check-contract-metadata-drift.test.js scripts/verify-mainnet-deployment-gate.test.js scripts/rollback-migration.test.js
 
       # Affected-package execution with Turbo caching
       - name: Run CI tasks for ${{ matrix.package }}
@@ -66,6 +66,64 @@ jobs:
           pnpm turbo run lint type-check test build \
             --filter="${{ matrix.package }}..." \
             --cache-dir=".turbo/cache"
+
+  # ── Database migration smoke test (issue #440) ──────────────────────────
+  # Spins up a fresh temporary Supabase test schema, applies all migrations in
+  # sequential order via run-migration-supabase.js, asserts the final schema
+  # matches the expected state, and tests rolling back the most recent migration.
+  migration-smoke-test:
+    name: Migration Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Check for supabase/migrations changes
+        id: migration-diff
+        run: |
+          BASE_REF="${{ github.base_ref || 'main' }}"
+          git fetch origin "$BASE_REF" --depth=1 2>/dev/null || true
+          CHANGED=$(git diff --name-only "origin/$BASE_REF...HEAD" 2>/dev/null | grep -E '(^|/)supabase/migrations/|run-migration-supabase\.js|rollback-migration' || true)
+          if [ -n "$CHANGED" ]; then
+            echo "touched=true" >> "$GITHUB_OUTPUT"
+            echo "Detected migration changes:"
+            echo "$CHANGED"
+          else
+            echo "touched=false" >> "$GITHUB_OUTPUT"
+            echo "No direct supabase/migrations/ diff detected; running baseline smoke test."
+          fi
+
+      - name: Run fresh-schema migration smoke test (run-migration-supabase.js)
+        env:
+          MIGRATION_SMOKE_TEST: "1"
+          MIGRATION_TEST_SCHEMA: "migration_smoke_test"
+          MIGRATION_STATE_FILE: "/tmp/quickex-migration-smoke-db.json"
+        run: |
+          node app/backend/run-migration-supabase.js \
+            --smoke-test \
+            --schema migration_smoke_test \
+            --state-file /tmp/quickex-migration-smoke-db.json
+
+      - name: Verify rollback of most recent migration and re-apply idempotency
+        run: |
+          ./scripts/rollback-migration.sh \
+            --schema migration_smoke_test \
+            --state-file /tmp/quickex-migration-smoke-db.json
+          node app/backend/run-migration-supabase.js \
+            --schema migration_smoke_test \
+            --state-file /tmp/quickex-migration-smoke-db.json
+
+      - name: Run migration and rollback unit test suite
+        run: |
+          node app/backend/scripts/verify-migrations.js
+          node --test scripts/rollback-migration.test.js
 
   # -- Documentation gate (issue #295) ---------------------------------------
   # Validates that docs/openapi.json, the contract map, and the mobile env docs
@@ -162,7 +220,7 @@ jobs:
   scorecard:
     name: Release Quality Scorecard
     runs-on: ubuntu-latest
-    needs: [validate, secret-scan]
+    needs: [validate, migration-smoke-test, secret-scan]
     if: always()
     steps:
       - name: Checkout Code

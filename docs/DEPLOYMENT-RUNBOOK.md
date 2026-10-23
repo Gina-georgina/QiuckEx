@@ -49,6 +49,12 @@ failure in the GitHub Actions run. Confirm the active target in the platform
 control plane before retrying. Do not stop or remove either slot until the
 rollback or promotion is verified.
 
+If a database migration fails or needs to be reverted after a failed rollout,
+run `./scripts/rollback-migration.sh --dry-run` followed by
+`./scripts/rollback-migration.sh --yes` against the target environment. See
+[MIGRATION-RUNBOOK.md](./MIGRATION-RUNBOOK.md) for the complete database
+rollback procedure.
+
 ### Operational verification
 
 After promotion, verify that the traffic controller reports the newly promoted

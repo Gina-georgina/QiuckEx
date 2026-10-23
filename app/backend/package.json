@@ -82,6 +82,8 @@
     "test:smoke:remote": "node scripts/smoke-test.mjs",
     "test:smoke:remote:ci": "node scripts/smoke-test.mjs",
     "test:mutation": "node scripts/run-mutation-tests.js",
+    "db:migrate": "node run-migration-supabase.js",
+    "db:rollback": "bash ../../scripts/rollback-migration.sh",
     "db:verify-migrations": "node scripts/verify-migrations.js",
     "test:perf:horizon": "node scripts/horizon-perf-regression.js",
     "api:compat:check": "node scripts/api-compat-check.js"
