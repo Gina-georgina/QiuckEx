@@ -4,10 +4,7 @@ import { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import QRCode from 'react-qr-code';
 
-interface ScamAlert {
-  isScam: boolean;
-  reason?: string;
-}
+type ScamAlert = ScamSignal;
 
 interface PaymentPageProps {
   scamAlert?: ScamAlert;
@@ -26,7 +23,13 @@ export default function PaymentPage({ scamAlert }: PaymentPageProps) {
   const amount = (params?.amount as string) ?? '';
 
   const [showExplainer, setShowExplainer] = useState(false);
+  const router = useRouter();
   const [alert, setAlert] = useState<ScamAlert | null>(scamAlert ?? null);
+  const [riskAccepted, setRiskAccepted] = useState(false);
+  const [bannerDismissed, setBannerDismissed] = useState(false);
+  // Treat alerts without an explicit confidence as high: fail safe.
+  const isHighConfidence = alert?.isScam === true && alert.confidence !== 'low';
+  const blocked = isHighConfidence && !riskAccepted;
 
   useEffect(() => {
     if (scamAlert) {
