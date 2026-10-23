@@ -6,7 +6,7 @@
  * **Validates: Requirements 13.1, 13.2, 13.3**
  */
 
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import * as client from 'prom-client';
 import { JobType } from './types';
 import { MetricsService } from '../metrics/metrics.service';
@@ -23,6 +23,7 @@ import { MetricsService } from '../metrics/metrics.service';
  */
 @Injectable()
 export class JobQueueMetricsService implements OnModuleInit {
+  private readonly logger = new Logger(JobQueueMetricsService.name);
   // Counter metrics
   private jobsEnqueuedTotal: client.Counter<string>;
   private jobsCompletedTotal: client.Counter<string>;
@@ -116,8 +117,8 @@ export class JobQueueMetricsService implements OnModuleInit {
       });
 
       this.initialized = true;
-    } catch (error) {
-      console.error('Failed to initialize job queue metrics:', error);
+    } catch {
+      this.logger.error('Failed to initialize job queue metrics');
       this.initialized = false;
     }
   }

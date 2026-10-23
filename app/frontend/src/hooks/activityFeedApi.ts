@@ -15,6 +15,8 @@ export interface ActivityFeedItem {
   source: string;
   destination: string;
   timestamp: string; // raw ISO for sorting
+  fee?: string | null;
+  ledger?: number | null;
 }
 
 interface BackendTransactionItem {
@@ -27,6 +29,8 @@ interface BackendTransactionItem {
   status: "Success" | "Pending";
   txHash: string;
   pagingToken: string;
+  fee?: string;
+  ledger?: number;
 }
 
 interface BackendResponse {
@@ -75,6 +79,8 @@ function mapToActivityItem(item: BackendTransactionItem): ActivityFeedItem {
     source: item.source,
     destination: item.destination,
     timestamp: item.timestamp,
+    fee: item.fee ?? null,
+    ledger: item.ledger ?? null,
   };
 }
 

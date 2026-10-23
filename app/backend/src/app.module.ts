@@ -1,4 +1,5 @@
 import {
+Logger,
 Module,
 MiddlewareConsumer,
 NestModule,
@@ -148,8 +149,9 @@ ObservabilityModule,
     baseImports.push(NotificationsModule as AppImport);
     baseImports.push(DeveloperModule as AppImport);
   } else {
-    console.log(
+    Logger.log(
       "Skipping Reconciliation & Notifications modules in dev (local Supabase)",
+      "AppModule",
     );
   }
 } catch (e) {

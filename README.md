@@ -256,3 +256,6 @@ Built with ❤️ by Pulsefy. Powered by Stellar. 🚀
 
 <!-- handsoff-issue-371 -->
 - #371: feat(contract): Add contract upgrade safety gate with version registry
+
+<!-- handsoff-issue-462 -->
+- #462: [Docs] Update CAPABILITY-MAP.md to reflect current feature flag states

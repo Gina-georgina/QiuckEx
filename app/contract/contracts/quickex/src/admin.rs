@@ -1,14 +1,14 @@
 use crate::errors::QuickexError;
 use crate::events::{
     publish_admin_changed, publish_contract_initialized, publish_contract_migrated,
-    publish_contract_paused, publish_fee_collector_rotated, publish_per_asset_fee_set,
-    publish_upgrade_completed, publish_upgrade_started,
+    publish_contract_paused, publish_contract_upgraded, publish_fee_collector_rotated,
+    publish_per_asset_fee_set, publish_upgrade_completed, publish_upgrade_started,
 };
 use crate::fee;
 use crate::fee_router;
 use crate::storage;
 use crate::types::{FeeConfig, PerAssetFeeConfig, Role, TtlExtensionFeeConfig};
-use soroban_sdk::{Address, Env, Vec};
+use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
 
 /// Initialize the contract with an admin address.
 ///
@@ -29,7 +29,7 @@ pub fn initialize(env: &Env, admin: Address) -> Result<(), QuickexError> {
     storage::set_admin_approval_count(env, 0);
     storage::set_admin_approval_ready(env, false);
     storage::set_paused(env, false, 0);
-    storage::set_contract_version(env, storage::CURRENT_CONTRACT_VERSION);
+    storage::set_schema_version(env, storage::SCHEMA_VERSION);
 
     // Grant Admin role to the initial administrator.
     let mut roles = Vec::new(env);
@@ -89,7 +89,7 @@ pub fn initialize_multisig(
     storage::set_admin_approval_count(env, 0);
     storage::set_admin_approval_ready(env, false);
     storage::set_paused(env, false, 0);
-    storage::set_contract_version(env, storage::CURRENT_CONTRACT_VERSION);
+    storage::set_schema_version(env, storage::SCHEMA_VERSION);
 
     for signer in signers.iter() {
         let mut roles = storage::get_roles(env, &signer);
@@ -381,15 +381,77 @@ pub fn get_version(env: &Env) -> u32 {
     storage::get_contract_version(env).unwrap_or(storage::LEGACY_CONTRACT_VERSION)
 }
 
-pub fn migrate(env: &Env, caller: &Address) -> Result<u32, QuickexError> {
-    if storage::governance_is_initialized(env)
-        && !storage::governance_execution_in_progress(env)
-    {
+/// Get the stored schema version (`0` for legacy deployments prior to schema tracking).
+pub fn get_schema_version(env: &Env) -> u32 {
+    storage::get_schema_version(env).unwrap_or(storage::LEGACY_SCHEMA_VERSION)
+}
+
+/// Validate that the incoming schema version is a sequential single-step upgrade
+/// (`new_version == old_version + 1`).
+///
+/// Rejects version skips (`new_version > old_version + 1`), same-version re-upgrades,
+/// and downgrades (`new_version <= old_version`) with [`QuickexError::InvalidContractVersion`].
+pub fn validate_schema_version(old_version: u32, new_version: u32) -> Result<(), QuickexError> {
+    match old_version.checked_add(1) {
+        Some(expected) if new_version == expected => Ok(()),
+        _ => Err(QuickexError::InvalidContractVersion),
+    }
+}
+
+/// Perform a version-guarded contract WASM upgrade (**Admin only**).
+///
+/// Reads the on-chain `schema_version` and compares it with the incoming binary's
+/// expected `SCHEMA_VERSION` (or pending upgrade target version if staged).
+/// Aborts with [`QuickexError::InvalidContractVersion`] if `new_version != old_version + 1`.
+pub fn upgrade(
+    env: &Env,
+    caller: &Address,
+    new_wasm_hash: BytesN<32>,
+) -> Result<(), QuickexError> {
+    if storage::governance_is_initialized(env) && !storage::governance_execution_in_progress(env) {
         return Err(QuickexError::GovernanceRequired);
     }
 
-    let from_version = get_version(env);
-    if from_version == storage::LEGACY_CONTRACT_VERSION {
+    let old_version = get_schema_version(env);
+    if old_version == storage::LEGACY_SCHEMA_VERSION && !storage::is_initialized(env) {
+        let admin = storage::get_admin(env).ok_or(QuickexError::Unauthorized)?;
+        if !storage::governance_execution_in_progress(env) {
+            caller.require_auth();
+            if admin != *caller {
+                return Err(QuickexError::InsufficientRole);
+            }
+        }
+    } else {
+        require_admin(env, caller)?;
+    }
+
+    let new_version =
+        storage::get_pending_upgrade_version(env).unwrap_or(storage::SCHEMA_VERSION);
+    validate_schema_version(old_version, new_version)?;
+
+    storage::set_wasm_hash(env, &new_wasm_hash);
+    #[cfg(not(test))]
+    env.deployer()
+        .update_current_contract_wasm(new_wasm_hash.clone());
+
+    publish_contract_upgraded(env, new_wasm_hash, caller);
+
+    Ok(())
+}
+
+/// Transform contract storage sequentially from the stored `schema_version`
+/// to [`storage::SCHEMA_VERSION`] (**Admin only**).
+///
+/// Idempotent: safe to call multiple times. When storage is already at
+/// `SCHEMA_VERSION`, this function validates post-upgrade invariants and
+/// returns `Ok(SCHEMA_VERSION)` without mutating state or re-emitting events.
+pub fn migrate_schema(env: &Env, caller: &Address) -> Result<u32, QuickexError> {
+    if storage::governance_is_initialized(env) && !storage::governance_execution_in_progress(env) {
+        return Err(QuickexError::GovernanceRequired);
+    }
+
+    let from_version = get_schema_version(env);
+    if from_version == storage::LEGACY_SCHEMA_VERSION {
         let admin = storage::get_admin(env).ok_or(QuickexError::Unauthorized)?;
         if !storage::governance_execution_in_progress(env) {
             caller.require_auth();
@@ -409,23 +471,38 @@ pub fn migrate(env: &Env, caller: &Address) -> Result<u32, QuickexError> {
         require_admin(env, caller)?;
     }
 
-    if from_version > storage::CURRENT_CONTRACT_VERSION {
+    if from_version > storage::SCHEMA_VERSION {
         return Err(QuickexError::InvalidContractVersion);
     }
 
+    if let Some(pending_target) = storage::get_pending_upgrade_version(env) {
+        if pending_target > storage::SCHEMA_VERSION
+            || (from_version < pending_target && pending_target != from_version.saturating_add(1))
+        {
+            return Err(QuickexError::InvalidContractVersion);
+        }
+    }
+
     let mut version = from_version;
-    while version < storage::CURRENT_CONTRACT_VERSION {
+    while version < storage::SCHEMA_VERSION {
+        let next_version = version
+            .checked_add(1)
+            .ok_or(QuickexError::InvalidContractVersion)?;
+        validate_schema_version(version, next_version)?;
         version = match version {
-            storage::LEGACY_CONTRACT_VERSION => migrate_legacy_to_v1(env),
+            storage::LEGACY_SCHEMA_VERSION => migrate_v0_to_v1(env)?,
             _ => return Err(QuickexError::InvalidContractVersion),
         };
     }
+
+    // Ensure both ContractVersion and SchemaVersion keys are synchronized.
+    storage::set_schema_version(env, version);
 
     if version != from_version {
         publish_contract_migrated(env, caller, from_version, version);
     }
 
-    // Post-upgrade invariant checks (Issue #432)
+    // Post-upgrade invariant checks (Issue #432 + #450)
     if let Err(_msg) = storage::assert_post_upgrade_invariants(env) {
         env.panic_with_error(QuickexError::InternalError);
     }
@@ -433,10 +510,46 @@ pub fn migrate(env: &Env, caller: &Address) -> Result<u32, QuickexError> {
     Ok(version)
 }
 
-fn migrate_legacy_to_v1(env: &Env) -> u32 {
-    storage::set_contract_version(env, storage::CURRENT_CONTRACT_VERSION);
+pub fn migrate(env: &Env, caller: &Address) -> Result<u32, QuickexError> {
+    migrate_schema(env, caller)
+}
+
+fn migrate_v0_to_v1(env: &Env) -> Result<u32, QuickexError> {
+    let admin = storage::get_admin(env).ok_or(QuickexError::Unauthorized)?;
+
+    // Ensure Admin role is seeded for the primary admin.
+    let mut roles = storage::get_roles(env, &admin);
+    if !roles.contains(Role::Admin) {
+        roles.push_back(Role::Admin);
+        storage::set_roles(env, &admin, &roles);
+    }
+
+    // Seed default multisig metadata if absent in v0 storage.
+    if storage::get_admin_signers(env).is_none() {
+        let mut signers = Vec::new(env);
+        signers.push_back(admin.clone());
+        storage::set_admin_signers(env, &signers);
+    }
+    if storage::get_admin_threshold(env).is_none() {
+        storage::set_admin_threshold(env, 1);
+    }
+
+    // Migrate legacy Symbol-based privacy key for admin if present.
+    let legacy_privacy_key = (Symbol::new(env, storage::PRIVACY_ENABLED_KEY), admin.clone());
+    if let Some(legacy_enabled) = env
+        .storage()
+        .persistent()
+        .get::<_, bool>(&legacy_privacy_key)
+    {
+        env.storage()
+            .persistent()
+            .set(&storage::DataKey::PrivacyEnabled(admin), &legacy_enabled);
+        env.storage().persistent().remove(&legacy_privacy_key);
+    }
+
     storage::set_initialized(env, true);
-    storage::CURRENT_CONTRACT_VERSION
+    storage::set_schema_version(env, storage::SCHEMA_VERSION);
+    Ok(storage::SCHEMA_VERSION)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -464,9 +577,25 @@ pub fn set_upgrade_window(
 /// Start an upgrade (enters gating state; requires active window).
 ///
 /// **Admin only**. Emits `UpgradeStarted` event with old/new versions.
-/// Blocks if window is not active or upgrade already in progress.
+/// Blocks if window is not active, upgrade already in progress, or if the
+/// target schema version violates sequential version guard rules (gap > 1).
 pub fn start_upgrade(env: &Env, caller: &Address, new_version: u32) -> Result<(), QuickexError> {
-    require_admin(env, caller)?;
+    let old_version = get_schema_version(env);
+    if old_version == storage::LEGACY_SCHEMA_VERSION && !storage::is_initialized(env) {
+        if storage::governance_is_initialized(env) && !storage::governance_execution_in_progress(env)
+        {
+            return Err(QuickexError::GovernanceRequired);
+        }
+        let admin = storage::get_admin(env).ok_or(QuickexError::Unauthorized)?;
+        if !storage::governance_execution_in_progress(env) {
+            caller.require_auth();
+            if admin != *caller {
+                return Err(QuickexError::InsufficientRole);
+            }
+        }
+    } else {
+        require_admin(env, caller)?;
+    }
 
     // Check upgrade window is active (Issue #432 AC1)
     if !storage::is_upgrade_window_active(env) {
@@ -477,9 +606,18 @@ pub fn start_upgrade(env: &Env, caller: &Address, new_version: u32) -> Result<()
         return Err(QuickexError::ContractPaused);
     }
 
-    let old_version = get_version(env);
+    // Pre-flight schema version guard (Issue #450):
+    // Reject version 0, downgrades, or version skips (gap > 1).
+    let max_allowed_version = old_version
+        .checked_add(1)
+        .ok_or(QuickexError::InvalidContractVersion)?;
+    if new_version == 0 || new_version < old_version || new_version > max_allowed_version {
+        return Err(QuickexError::InvalidContractVersion);
+    }
+
     let (window_start, window_end) = storage::get_upgrade_window(env);
 
+    storage::set_pending_upgrade_version(env, new_version);
     storage::set_upgrade_in_progress(env, true);
     publish_upgrade_started(
         env,
@@ -496,7 +634,7 @@ pub fn start_upgrade(env: &Env, caller: &Address, new_version: u32) -> Result<()
 /// Complete an upgrade (migrate state, update version, emit event).
 ///
 /// **Admin only**. Must be called after `start_upgrade` to finalize.
-/// Calls `migrate()` internally and re-checks invariants.
+/// Calls `migrate_schema()` internally and re-checks invariants.
 pub fn complete_upgrade(
     env: &Env,
     caller: &Address,
@@ -521,10 +659,11 @@ pub fn complete_upgrade(
         if new_version != expected_version {
             return Err(QuickexError::InvalidContractVersion);
         }
-        let old_version = get_version(env);
+        let old_version = get_schema_version(env);
+        validate_schema_version(old_version, expected_version)?;
         let authority = storage::get_admin(env).ok_or(QuickexError::Unauthorized)?;
         storage::set_governance_execution(env, true);
-        let migrated_version = migrate(env, &authority)?;
+        let migrated_version = migrate_schema(env, &authority)?;
         if migrated_version != expected_version {
             return Err(QuickexError::InvalidContractVersion);
         }
@@ -535,17 +674,23 @@ pub fn complete_upgrade(
         return Ok(migrated_version);
     }
 
-    let old_version = get_version(env);
+    let old_version = get_schema_version(env);
+    if new_version > old_version.saturating_add(1)
+        || (new_version != 0 && new_version < old_version)
+    {
+        return Err(QuickexError::InvalidContractVersion);
+    }
 
-    // Run migration
-    let migrated_version = migrate(env, caller)?;
+    // Run schema migration
+    let migrated_version = migrate_schema(env, caller)?;
 
-    // Ensure new version matches expected (Issue #432 AC2)
+    // Ensure new version matches expected (Issue #432 AC2 + #450)
     if migrated_version != new_version && new_version != 0 {
         return Err(QuickexError::InvalidContractVersion);
     }
 
     storage::set_upgrade_in_progress(env, false);
+    storage::clear_pending_upgrade_version(env);
     publish_upgrade_completed(env, caller, old_version, migrated_version);
 
     Ok(migrated_version)

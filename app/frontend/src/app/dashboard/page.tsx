@@ -27,6 +27,7 @@ import {
 import { PaymentHistoryFilters } from "@/components/PaymentHistoryFilters";
 import { cacheInvalidator } from "@/lib/cacheInvalidation";
 import { PaymentWizard } from "@/components/PaymentWizard/PaymentWizard";
+import { DashboardSkeleton } from "@/components/skeletons/Skeletons";
 
 function toAnchorId(prefix: string, value: string) {
   return `${prefix}-${value.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
@@ -258,14 +259,7 @@ function DashboardContent() {
   };
 
   if (loading) {
-    return (
-      <div className="flex min-h-[60vh] items-center justify-center">
-        <div className="text-center">
-          <div className="mb-4 h-8 w-8 animate-spin rounded-full border-2 border-indigo-500 border-t-transparent mx-auto" />
-          <p className="text-muted">Loading dashboard...</p>
-        </div>
-      </div>
-    );
+    return <DashboardSkeleton />;
   }
 
   if (error) {
@@ -408,9 +402,9 @@ function DashboardContent() {
         <section className="mb-10 grid grid-cols-1 gap-6 sm:grid-cols-2 md:mb-16 lg:grid-cols-3">
           {metricsLoading ? (
             <>
-              <div className="h-36 animate-pulse rounded-3xl border border-border bg-card p-6" />
-              <div className="h-36 animate-pulse rounded-3xl border border-border bg-card p-6" />
-              <div className="h-36 animate-pulse rounded-3xl border border-indigo-300/50 bg-indigo-500/50 p-6" />
+              <div aria-hidden="true" className="h-36 animate-pulse rounded-3xl border border-border bg-card p-6" />
+              <div aria-hidden="true" className="h-36 animate-pulse rounded-3xl border border-border bg-card p-6" />
+              <div aria-hidden="true" className="h-36 animate-pulse rounded-3xl border border-indigo-300/50 bg-indigo-500/50 p-6" />
             </>
           ) : metricsError ? (
             <div className="col-span-full rounded-3xl border border-red-500/20 bg-surface p-6 text-center">
@@ -890,7 +884,7 @@ function DashboardContent() {
 export default function Dashboard() {
   return (
     <Suspense
-      fallback={<p className="text-muted">Loading dashboard...</p>}
+      fallback={<DashboardSkeleton />}
     >
       <DashboardContent />
     </Suspense>

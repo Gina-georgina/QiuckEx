@@ -5,6 +5,8 @@ import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { fetchActivityFeed, type ActivityFeedItem } from "@/hooks/activityFeedApi";
 import { cacheInvalidator } from "@/lib/cacheInvalidation";
+import { TransactionTableSkeleton } from "@/components/skeletons/Skeletons";
+import { TransactionDetailModal } from "@/components/TransactionDetailModal";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -238,6 +240,7 @@ export default function PaymentHistoryContent() {
 
   const [items, setItems] = useState<ActivityFeedItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [selectedTx, setSelectedTx] = useState<ActivityFeedItem | null>(null);
   const [degraded, setDegraded] = useState(false);
 
   const [filters, setFilters] = useState<FilterState>(() =>
@@ -746,14 +749,8 @@ export default function PaymentHistoryContent() {
         </div>
 
         {/* Loading */}
-        {loading && (
-          <div className="py-20 text-center">
-            <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin mx-auto mb-4" />
-            <p className="text-subtle text-sm">Loading transactions…</p>
-          </div>
-        )}
+        {loading && <TransactionTableSkeleton />}
 
-        {/* Transaction table */}
         {!loading && filtered.length > 0 && (
           <div className="rounded-3xl bg-card border border-border overflow-hidden">
             <div className="overflow-x-auto">
@@ -793,7 +790,20 @@ export default function PaymentHistoryContent() {
                   {filtered.map((item) => (
                     <tr
                       key={item.id}
-                      className="hover:bg-white/[0.015] transition group"
+                      tabIndex={0}
+                      aria-label={`View details for ${item.amount} ${item.asset} transaction`}
+                      onClick={(e) => {
+                        if ((e.target as HTMLElement).closest("button, a")) return;
+                        setSelectedTx(item);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.target !== e.currentTarget) return;
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          setSelectedTx(item);
+                        }
+                      }}
+                      className="cursor-pointer hover:bg-white/[0.015] focus:outline-none focus-visible:bg-white/[0.03] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-500 transition group"
                     >
                       <td className="px-6 py-4 text-sm text-subtle whitespace-nowrap">
                         {formatDate(item.timestamp)}
@@ -877,6 +887,8 @@ export default function PaymentHistoryContent() {
         {/* Empty state */}
         {!loading && filtered.length === 0 && <EmptyState />}
       </main>
+
+      <TransactionDetailModal transaction={selectedTx} onClose={() => setSelectedTx(null)} />
     </div>
   );
 }

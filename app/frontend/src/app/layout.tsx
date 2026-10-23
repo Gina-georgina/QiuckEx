@@ -4,6 +4,7 @@ import { getLocale, getMessages } from "next-intl/server";
 import { Header } from "@/components/Header";
 import { StagingBanner } from "@/components/StagingBanner";
 import { EnvGuard } from "@/components/EnvGuard";
+import { OnboardingModal } from "@/components/onboarding/OnboardingModal";
 import { NotificationCenterProvider } from "@/components/NotificationCenterProvider";
 import { ErrorReportingShell } from "@/components/ErrorReportingShell";
 import { ThemeProvider, themeInitScript } from "@/components/ThemeProvider";
@@ -85,6 +86,7 @@ export default async function RootLayout({
                       {children}
                     </main>
                   </ErrorReportingShell>
+                  <OnboardingModal />
 
                   <footer className="container mx-auto border-t border-border px-6 py-12 text-sm text-subtle">
                     <div className="flex flex-col items-center justify-between gap-6 md:flex-row">
