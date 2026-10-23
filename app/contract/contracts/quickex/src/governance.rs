@@ -111,7 +111,11 @@ fn validate_action(env: &Env, action: &GovernanceAction) -> Result<(), QuickexEr
             if storage::is_upgrade_in_progress(env) {
                 return Err(QuickexError::UpgradeAlreadyInProgress);
             }
-            if *version == 0 {
+            let old_version = crate::admin::get_schema_version(env);
+            if *version == 0
+                || *version < old_version
+                || *version > old_version.saturating_add(1)
+            {
                 return Err(QuickexError::InvalidContractVersion);
             }
             Ok(())
@@ -346,6 +350,8 @@ fn apply_action(
             if storage::is_upgrade_in_progress(env) {
                 return Err(QuickexError::UpgradeAlreadyInProgress);
             }
+            let old_version = crate::admin::get_schema_version(env);
+            crate::admin::validate_schema_version(old_version, *version)?;
             storage::set_pending_upgrade_version(env, *version);
             storage::set_upgrade_in_progress(env, true);
             storage::set_wasm_hash(env, wasm_hash);
@@ -353,11 +359,12 @@ fn apply_action(
             events::publish_upgrade_started(
                 env,
                 authority,
-                crate::admin::get_version(env),
+                old_version,
                 *version,
                 window_start,
                 window_end,
             );
+            #[cfg(not(test))]
             env.deployer()
                 .update_current_contract_wasm(wasm_hash.clone());
             events::publish_contract_upgraded(env, wasm_hash.clone(), authority);

@@ -94,6 +94,9 @@ use types::{
 /// Disputed --> Spent   : resolve_dispute() [arbiter decides for recipient]
 /// Disputed --> Refunded: resolve_dispute() [arbiter decides for owner]
 /// ```
+/// Expected on-chain storage schema version for this contract binary (Issue #450).
+pub const SCHEMA_VERSION: u32 = storage::SCHEMA_VERSION;
+
 #[contract]
 pub struct QuickexContract;
 
@@ -919,6 +922,13 @@ impl QuickexContract {
         admin::get_version(&env)
     }
 
+    /// Get the stored on-chain storage schema version (Issue #450).
+    ///
+    /// Returns `0` for legacy deployments created before schema version tracking existed.
+    pub fn get_schema_version(env: Env) -> u32 {
+        admin::get_schema_version(&env)
+    }
+
     /// Return deployment metadata for compatibility validation.
     ///
     /// Clients and indexers can call this view (no auth required) to detect
@@ -947,6 +957,16 @@ impl QuickexContract {
     pub fn migrate(env: Env, caller: Address) -> Result<u32, QuickexError> {
         pause_policy::require_admin_entry_allowed(&env)?;
         admin::migrate(&env, &caller)
+    }
+
+    /// Transform contract storage from the stored schema version to the current
+    /// [`SCHEMA_VERSION`] (**Admin only**, Issue #450).
+    ///
+    /// Sequential and idempotent: safe to call multiple times without side effects
+    /// once storage has reached [`SCHEMA_VERSION`].
+    pub fn migrate_schema(env: Env, caller: Address) -> Result<u32, QuickexError> {
+        pause_policy::require_admin_entry_allowed(&env)?;
+        admin::migrate_schema(&env, &caller)
     }
 
     /// Pause or unpause the contract (**Admin only**).
@@ -1532,8 +1552,9 @@ impl QuickexContract {
     ///
     /// Caller must have the [`Role::Admin`] role and authorize before governance bootstrap.
     /// After governance bootstrap, upgrades must use an approved timelocked proposal.
-    /// The new WASM must be pre-uploaded to the network.
-    /// Emits an upgrade event for audit.
+    /// Reads the on-chain `schema_version` and validates sequential compatibility
+    /// (`new_version == old_version + 1`) against the incoming binary's expected
+    /// [`SCHEMA_VERSION`] (or staged target version).
     ///
     /// # Arguments
     /// * `env` - The contract environment
@@ -1542,25 +1563,18 @@ impl QuickexContract {
     ///
     /// # Errors
     /// * `Unauthorized` - Caller is not the admin, or admin not set
+    /// * `InvalidContractVersion` - Schema version gap != 1 (`new_version != old_version + 1`)
     ///
     /// # Security
-    /// Updates the contract's executable code. Call [`migrate`](QuickexContract::migrate)
-    /// afterwards if the new release requires storage migration.
+    /// Updates the contract's executable code. Call [`migrate_schema`](QuickexContract::migrate_schema)
+    /// (or [`migrate`](QuickexContract::migrate)) afterwards to transform storage to the new schema.
     pub fn upgrade(
         env: Env,
         caller: Address,
         new_wasm_hash: BytesN<32>,
     ) -> Result<(), QuickexError> {
         pause_policy::require_admin_entry_allowed(&env)?;
-        admin::require_admin(&env, &caller)?;
-
-        storage::set_wasm_hash(&env, &new_wasm_hash);
-        env.deployer()
-            .update_current_contract_wasm(new_wasm_hash.clone());
-
-        events::publish_contract_upgraded(&env, new_wasm_hash, &caller);
-
-        Ok(())
+        admin::upgrade(&env, &caller, new_wasm_hash)
     }
 
     /// Set the upgrade window: when upgrades are permitted (**Admin only**).
