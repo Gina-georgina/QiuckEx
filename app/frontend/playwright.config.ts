@@ -5,6 +5,14 @@ export default defineConfig({
   testMatch: ["visual/**/*.spec.ts", "__tests__/**/*.spec.ts"],
   fullyParallel: true,
   reporter: process.env.CI ? "github" : "list",
+  expect: {
+    toHaveScreenshot: {
+      maxDiffPixelRatio: 0.002,
+      animations: "disabled",
+      caret: "hide",
+      scale: "css",
+    },
+  },
   use: {
     baseURL: "http://127.0.0.1:3173",
     browserName: "chromium",
@@ -14,6 +22,7 @@ export default defineConfig({
     trace: "retain-on-failure",
   },
   outputDir: "test-results",
+  snapshotDir: "./visual/snapshots",
   webServer: {
     command: "npm run dev -- --hostname 127.0.0.1 --port 3173",
     url: "http://127.0.0.1:3173",

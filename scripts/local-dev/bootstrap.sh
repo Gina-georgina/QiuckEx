@@ -7,6 +7,7 @@
 #   ./scripts/local-dev/bootstrap.sh --seed-only  # apply fixtures to a running stack
 #   ./scripts/local-dev/bootstrap.sh --check      # verify the stack, seed nothing
 #   ./scripts/local-dev/bootstrap.sh --reset      # drop local data, then bootstrap
+#   ./scripts/local-dev/bootstrap.sh --docker     # full stack via docker compose
 #   ./scripts/local-dev/bootstrap.sh --help
 #
 # Steps, in order:
@@ -42,10 +43,11 @@ NC='\033[0m'
 SEED_ONLY=false
 CHECK_ONLY=false
 RESET=false
+DOCKER=false
 ERRORS=0
 
 usage() {
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -59,6 +61,7 @@ for arg in "$@"; do
     --seed-only) SEED_ONLY=true ;;
     --check)     CHECK_ONLY=true ;;
     --reset)     RESET=true ;;
+    --docker)    DOCKER=true ;;
     --help|-h)   usage ;;
     *) echo "Unknown option: $arg" >&2; usage ;;
   esac
@@ -202,8 +205,39 @@ summary() {
 }
 
 
+# ── Docker Compose ──────────────────────────────────────────────────────────
+# Brings up backend, frontend, Postgres, Supabase Auth and Redis together.
+# See docs/LOCAL-DEV.md.
+docker_up() {
+  log "Starting the full stack with Docker Compose"
+  if ! docker compose version >/dev/null 2>&1; then
+    fail "Docker Compose v2 not found. Install Docker: https://docs.docker.com/get-docker/"
+    exit 1
+  fi
+  if [ "$RESET" = true ]; then
+    (cd "$REPO_ROOT" && docker compose down -v)
+  fi
+  (cd "$REPO_ROOT" && docker compose up -d)
+  log "Waiting for the backend at http://localhost:4000/health"
+  for _ in $(seq 1 180); do
+    if curl -fsS http://localhost:4000/health >/dev/null 2>&1; then
+      ok "Backend healthy; frontend at http://localhost:3000"
+      return 0
+    fi
+    sleep 2
+  done
+  fail "Backend did not become healthy. Inspect with: docker compose logs backend"
+  exit 1
+}
+
+
 # ── Main ────────────────────────────────────────────────────────────────────
 main() {
+  if [ "$DOCKER" = true ]; then
+    docker_up
+    exit 0
+  fi
+
   if [ "$CHECK_ONLY" = true ]; then
     preflight
     verify

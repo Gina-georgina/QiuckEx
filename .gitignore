@@ -94,3 +94,5 @@ main
 # Temporary scan outputs and gitleaks reports are ignored.
 .secrets.baseline.new
 .gitleaks-report.json
+
+docker-compose.override.yml
