@@ -7,7 +7,8 @@ import QRCode from 'react-qr-code';
 type ScamAlert = ScamSignal;
 
 interface PaymentPageProps {
-  scamAlert?: ScamAlert;
+  params: Promise<{ username: string; amount: string }>;
+  searchParams: Promise<{ asset?: string }>;
 }
 
 const isMobile = (): boolean => {
@@ -70,6 +71,7 @@ export default function PaymentPage({ scamAlert }: PaymentPageProps) {
       window.open('https://www.freighter.app/', '_blank', 'noopener,noreferrer');
     }
   };
+}
 
   const handleLobstr = () => {
     window.open(
